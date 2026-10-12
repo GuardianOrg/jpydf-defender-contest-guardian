@@ -74,14 +74,20 @@ abstract contract MainnetPriceFeedBase is IMainnetPriceFeed {
         return (scaledPrice, oracleIsDown, updatedAt);
     }
 
-    function _shutDownAndSwitchToLastGoodPrice(address _failedOracleAddr) internal returns (uint256) {
-        // Shut down the branch
+    function _shutDownAndReturnLastGoodPrice(address _failedOracleAddr) internal returns (uint256) {
+        // Enter the recoverable oracle-failure shutdown. Keep retrying the primary source so
+        // PriceFeedProxy can prove recovery before resuming the branch.
         borrowerOperations.shutdownFromOracleFailure();
-
-        priceSource = PriceSource.lastGoodPrice;
 
         emit ShutDownFromOracleFailure(_failedOracleAddr);
         return lastGoodPrice;
+    }
+
+    /// @dev Legacy name retained for archived feed sources that are compiled by historical tests.
+    function _shutDownAndSwitchToLastGoodPrice(address _failedOracleAddr) internal returns (uint256) {
+        uint256 fallbackPrice = _shutDownAndReturnLastGoodPrice(_failedOracleAddr);
+        priceSource = PriceSource.lastGoodPrice;
+        return fallbackPrice;
     }
 
     function _getCurrentChainlinkResponse(AggregatorV3Interface _aggregator)

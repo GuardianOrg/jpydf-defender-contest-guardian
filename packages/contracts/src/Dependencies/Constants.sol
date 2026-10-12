@@ -89,8 +89,8 @@ uint256 constant LIQUIDATION_PENALTY_REDISTRIBUTION_DJGB = 5 * _1pct; // 5%
 uint256 constant COLL_GAS_COMPENSATION_DIVISOR = 200; // dividing by 200 yields 0.5%
 uint256 constant COLL_GAS_COMPENSATION_CAP = 1_000 ether; // Max coll gas compensation capped at 1,000 coll units
 
-// Minimum amount of net JPYDF debt a trove must have
-uint256 constant MIN_DEBT = 300_000e18;
+// Minimum entire JPYdf debt a Trove must have, including its upfront fee.
+uint256 constant MIN_DEBT = 100_000e18;
 
 uint256 constant MIN_ANNUAL_INTEREST_RATE = _1pct / 2; // 0.5%
 uint256 constant MAX_ANNUAL_INTEREST_RATE = 250 * _1pct;

@@ -41,6 +41,13 @@ interface IWstETHRate {
  *      diff is limited to Chainlink response-validation hardening, and the extra
  *      JPY/backing logic lives only in DF files.
  *
+ *      Redemptions additionally derive a market-sensitive stETH/USD reference as
+ *      ETH/USD x stETH/ETH, then use max(direct stETH/USD, derived stETH/USD).
+ *      This closes the direct-feed update lag without pricing a genuine stETH depeg
+ *      at par with ETH. Normal redemption fails closed if either reference feed is
+ *      unavailable. Urgent redemption after irreversible shutdown also fails closed:
+ *      wind-down never settles against a direct-only or cached quote.
+ *
  *      Mainnet: stETH/USD `0xCfE54B5cD566aB89272946F602D76Ea879CAb4a8`,
  *      wstETH (rate provider) `0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0`.
  */
@@ -54,7 +61,19 @@ contract DFWstETHPriceFeed is CompositePriceFeed {
     error InvalidRateProviderRate();
     error InvalidJpyUsdRateProvider();
 
+    event RedemptionReferenceUnavailable(address indexed oracle, uint256 stEthUsdPrice);
+    event UrgentRedemptionReferenceUnavailable(address indexed oracle, uint256 stEthUsdPrice);
+
+    enum PriceUse {
+        Normal,
+        Redemption,
+        UrgentRedemption
+    }
+
     IJpyUsdRateProvider public immutable jpyUsdRateProvider;
+
+    Oracle public redemptionEthUsdOracle;
+    Oracle public redemptionStEthEthOracle;
 
     address public immutable collateralVault;
     // Backing-ratio state operated on by JpyFreezeLib (see its field docs).
@@ -62,8 +81,12 @@ contract DFWstETHPriceFeed is CompositePriceFeed {
 
     constructor(
         address _stEthUsdOracleAddress,
+        address _redemptionEthUsdOracleAddress,
+        address _redemptionStEthEthOracleAddress,
         address _wstEthAddress,
         uint256 _stEthUsdStalenessThreshold,
+        uint256 _redemptionEthUsdStalenessThreshold,
+        uint256 _redemptionStEthEthStalenessThreshold,
         address _jpyUsdRateProviderAddress,
         address _collateralVaultAddress,
         address _borrowerOperationsAddress
@@ -72,6 +95,16 @@ contract DFWstETHPriceFeed is CompositePriceFeed {
             _stEthUsdOracleAddress, _wstEthAddress, _stEthUsdStalenessThreshold, _borrowerOperationsAddress
         )
     {
+        redemptionEthUsdOracle.aggregator = AggregatorV3Interface(_redemptionEthUsdOracleAddress);
+        redemptionEthUsdOracle.stalenessThreshold = _redemptionEthUsdStalenessThreshold;
+        redemptionEthUsdOracle.decimals = redemptionEthUsdOracle.aggregator.decimals();
+        assert(redemptionEthUsdOracle.decimals == 8);
+
+        redemptionStEthEthOracle.aggregator = AggregatorV3Interface(_redemptionStEthEthOracleAddress);
+        redemptionStEthEthOracle.stalenessThreshold = _redemptionStEthEthStalenessThreshold;
+        redemptionStEthEthOracle.decimals = redemptionStEthEthOracle.aggregator.decimals();
+        assert(redemptionStEthEthOracle.decimals == 18);
+
         _validateRateProvider(_wstEthAddress);
 
         if (_collateralVaultAddress.code.length == 0) revert InvalidCollateralVault();
@@ -84,6 +117,11 @@ contract DFWstETHPriceFeed is CompositePriceFeed {
         // Fetch an initial price and confirm the oracle setup is live at deploy time.
         _fetchPricePrimary(false);
         if (priceSource != PriceSource.primary || lastGoodPrice == 0) revert InvalidInitialPrice();
+
+        (, bool redemptionEthUsdOracleDown) = _getOracleAnswer(redemptionEthUsdOracle);
+        if (redemptionEthUsdOracleDown) revert InvalidInitialPrice();
+        (, bool redemptionStEthEthOracleDown) = _getOracleAnswer(redemptionStEthEthOracle);
+        if (redemptionStEthEthOracleDown) revert InvalidInitialPrice();
     }
 
     function _validateRateProvider(address _wstEthAddress) private view {
@@ -94,35 +132,64 @@ contract DFWstETHPriceFeed is CompositePriceFeed {
 
     /**
      * @dev Primary path. `ethUsdOracle` is the upstream slot reused as stETH/USD.
-     *      wstETH has only this single USD source (no separate market feed), so any
-     *      failure switches straight to lastGoodPrice. Redemption uses the same
-     *      price as all other ops because there is no market-vs-canonical
-     *      divergence to arbitrage.
+     *      Normal pricing uses stETH/USD. Redemption uses the higher of direct
+     *      stETH/USD and ETH/USD x stETH/ETH. An unavailable reference
+     *      fails the redemption quote closed so the normal stETH/USD quote can never
+     *      silently reopen the oracle-lag arbitrage.
      */
-    function _fetchPricePrimary(bool) internal override returns (uint256, bool) {
+    function _fetchPricePrimary(bool _isRedemption) internal override returns (uint256, bool) {
+        return _fetchPricePrimaryFor(_isRedemption ? PriceUse.Redemption : PriceUse.Normal);
+    }
+
+    function fetchUrgentRedemptionPrice() public override returns (uint256, bool) {
+        if (priceSource == PriceSource.primary) return _fetchPricePrimaryFor(PriceUse.UrgentRedemption);
+
+        assert(priceSource == PriceSource.lastGoodPrice);
+        return (lastGoodPrice, true);
+    }
+
+    function _fetchPricePrimaryFor(PriceUse _priceUse) internal returns (uint256, bool) {
         assert(priceSource == PriceSource.primary);
 
         // stETH/USD (18-dec normalized).
         (uint256 stEthUsdPrice, bool stEthUsdOracleDown) = _getOracleAnswer(ethUsdOracle);
         if (stEthUsdOracleDown) {
-            return (_shutDownAndSwitchToLastGoodPrice(address(ethUsdOracle.aggregator)), true);
+            return (_shutDownAndReturnLastGoodPrice(address(ethUsdOracle.aggregator)), true);
         }
 
         // stETH per wstETH (canonical rate, 18-dec).
         (uint256 stEthPerWstEth, bool rateIsDown) = _getCanonicalRate();
         if (rateIsDown) {
-            return (_shutDownAndSwitchToLastGoodPrice(rateProviderAddress), true);
+            return (_shutDownAndReturnLastGoodPrice(rateProviderAddress), true);
         }
 
-        // wstETH/USD = stETH/USD × (stETH per wstETH); both 18-dec, so divide by 1e18.
-        uint256 wstEthUsdPrice = Math.mulDiv(stEthUsdPrice, stEthPerWstEth, 1e18);
+        uint256 usdPrice = stEthUsdPrice;
+        if (_priceUse != PriceUse.Normal) {
+            (uint256 redemptionReference, bool referenceDown, address failedOracle) = _getRedemptionReference();
+            if (referenceDown && _priceUse == PriceUse.Redemption) {
+                emit RedemptionReferenceUnavailable(failedOracle, stEthUsdPrice);
+                // The production caller is PriceFeedProxy, so a direct source -> BO pause call
+                // fails BO's caller check. Absorb that expected topology mismatch so this
+                // dedicated alert survives and return failure=true for the registered Proxy to
+                // latch the pause. A directly registered test/source still signals BO here.
+                try borrowerOperations.shutdownFromOracleFailure() {} catch {}
+                return (lastGoodPrice, true);
+            } else if (referenceDown) {
+                emit UrgentRedemptionReferenceUnavailable(failedOracle, stEthUsdPrice);
+                return (lastGoodPrice, true);
+            } else if (redemptionReference > usdPrice) {
+                usdPrice = redemptionReference;
+            }
+        }
 
-        // SHARED JPY/USD leg: a JPY-leg failure must NOT terminally shut the branch down
-        // (that would make the shared FX dependency a single point of total failure across
-        // all branches). Substitute the last good JPY rate and keep operating; the stETH/USD
+        // wstETH/USD = selected USD price × (stETH per wstETH); both 18-dec.
+        uint256 wstEthUsdPrice = Math.mulDiv(usdPrice, stEthPerWstEth, 1e18);
+
+        // SHARED JPY/USD leg: a JPY-leg failure must not synchronously stop every branch.
+        // Substitute the last good JPY rate and keep operating; the stETH/USD
         // and canonical legs above are still live, so the price tracks them and only the
         // (low-vol) FX leg is frozen. Auto-resumes when JPY/USD is fresh again; a prolonged
-        // freeze escalates to normal branch shutdown so the feed never serves arbitrarily
+        // freeze escalates to recoverable oracle shutdown so the feed never serves arbitrarily
         // stale FX (ORCL-SEC-005).
         (uint256 wstEthJpyPrice, bool jpyFreezeExpired) =
             JpyFreezeLib.convertUsdPriceToJpyWithFreeze(jpyUsdRateProvider, wstEthUsdPrice);
@@ -133,11 +200,25 @@ contract DFWstETHPriceFeed is CompositePriceFeed {
         (uint256 dTokenJpyPrice, bool backingUnavailable) =
             jpyConversionState.applyBackingRatio(collateralVault, wstEthJpyPrice);
         if (backingUnavailable) {
-            return (_shutDownAndSwitchToLastGoodPrice(collateralVault), true);
+            return (_shutDownAndReturnLastGoodPrice(collateralVault), true);
         }
 
-        lastGoodPrice = dTokenJpyPrice;
+        // `lastGoodPrice` belongs to the normal borrow/liquidation path. The
+        // enclosing PriceFeedProxy maintains a distinct redemption cache, so a
+        // borrower-protective redemption quote must never contaminate this source
+        // cache and later overvalue collateral during a normal-source failure.
+        if (_priceUse == PriceUse.Normal) lastGoodPrice = dTokenJpyPrice;
         return (dTokenJpyPrice, false);
+    }
+
+    function _getRedemptionReference() internal view returns (uint256, bool, address) {
+        (uint256 ethUsdPrice, bool ethUsdOracleDown) = _getOracleAnswer(redemptionEthUsdOracle);
+        if (ethUsdOracleDown) return (0, true, address(redemptionEthUsdOracle.aggregator));
+
+        (uint256 stEthEthPrice, bool stEthEthOracleDown) = _getOracleAnswer(redemptionStEthEthOracle);
+        if (stEthEthOracleDown) return (0, true, address(redemptionStEthEthOracle.aggregator));
+
+        return (Math.mulDiv(ethUsdPrice, stEthEthPrice, 1e18), false, address(0));
     }
 
     /**
@@ -164,14 +245,7 @@ contract DFWstETHPriceFeed is CompositePriceFeed {
 
     /// @dev Shared-JPY-failure shutdown; see `JpyFreezeLib.shutDownFromSharedJpyFailure`.
     function _shutDownFromSharedJpyFailure() internal returns (uint256) {
-        // Latch the terminal source state only when the branch was actually shut down. Staying
-        // on `primary` is safe: while the oracle remains unhealthy, the provider re-reports
-        // failure=true until the registered caller acts on it. A later fresh response starts a
-        // new provider episode, but cannot reactivate a branch that already latched shutdown.
-        // See test/JpySharedShutdownLatch.t.sol.
-        if (JpyFreezeLib.shutDownFromSharedJpyFailure(borrowerOperations, jpyUsdRateProvider)) {
-            priceSource = PriceSource.lastGoodPrice;
-        }
+        JpyFreezeLib.shutDownFromSharedJpyFailure(borrowerOperations, jpyUsdRateProvider);
         return lastGoodPrice;
     }
 }

@@ -41,7 +41,14 @@ contract CollateralYieldZapper is BaseZapper, ReentrancyGuard {
     IERC20 public immutable collToken;
     /// @notice Lido stETH, resolved from the branch underlying when it is wstETH; address(0) otherwise.
     IERC20 public immutable stEthToken;
+    /// @notice Protocol-designated Lido referral recorded on every native-ETH `submit` for
+    ///         Rewards Share attribution. address(0) disables attribution.
+    ///         Deliberately not user-, URL-, or referral-registry-controlled.
+    address public lidoReferral;
+    /// @notice Governance address authorized to update Lido Rewards Share attribution.
+    address public immutable lidoReferralManager;
 
+    event LidoReferralUpdated(address indexed oldReferral, address indexed newReferral);
     event NativeEthRouteDeposit(
         address indexed user,
         uint256 indexed troveId,
@@ -75,14 +82,20 @@ contract CollateralYieldZapper is BaseZapper, ReentrancyGuard {
     error CollateralYieldZapper__StEthMismatch(address resolved, address expected);
     error CollateralYieldZapper__StEthSubmitFailed(bytes reason);
     error CollateralYieldZapper__InsufficientWstEthOut(uint256 actual, uint256 minimum);
+    error CollateralYieldZapper__UnauthorizedReferralManager();
 
     constructor(
         IAddressesRegistry _addressesRegistry,
         ICollateralVault _collateralVault,
         IERC20 _underlyingToken,
-        address _expectedStEth
+        address _expectedStEth,
+        address _lidoReferral,
+        address _lidoReferralManager
     ) BaseZapper(_addressesRegistry) {
-        if (address(_collateralVault) == address(0) || address(_underlyingToken) == address(0)) {
+        if (
+            address(_collateralVault) == address(0) || address(_underlyingToken) == address(0)
+                || _lidoReferralManager == address(0)
+        ) {
             revert CollateralYieldZapper__ZeroAddress();
         }
         if (address(_collateralVault).code.length == 0) {
@@ -119,10 +132,21 @@ contract CollateralYieldZapper is BaseZapper, ReentrancyGuard {
             stEth_ = resolvedStEth;
         }
         stEthToken = IERC20(stEth_);
+        lidoReferral = _lidoReferral;
+        lidoReferralManager = _lidoReferralManager;
 
         IERC20(address(WETH)).forceApprove(address(borrowerOperations), type(uint256).max);
         collToken_.forceApprove(address(borrowerOperations), type(uint256).max);
         _underlyingToken.forceApprove(address(_collateralVault), type(uint256).max);
+    }
+
+    /// @notice Updates the protocol-designated Lido Rewards Share attribution address.
+    /// @dev The immutable manager is expected to be the protocol Timelock. Zero disables attribution.
+    function setLidoReferral(address _newReferral) external {
+        if (msg.sender != lidoReferralManager) revert CollateralYieldZapper__UnauthorizedReferralManager();
+        address oldReferral = lidoReferral;
+        lidoReferral = _newReferral;
+        emit LidoReferralUpdated(oldReferral, _newReferral);
     }
 
     receive() external payable {
@@ -576,7 +600,7 @@ contract CollateralYieldZapper is BaseZapper, ReentrancyGuard {
         IERC20 wstEth = underlyingToken;
 
         uint256 stEthBalanceBefore = stEthCached.balanceOf(address(this));
-        try IStETHSubmit(address(stEthCached)).submit{value: _ethAmount}(address(0)) {}
+        try IStETHSubmit(address(stEthCached)).submit{value: _ethAmount}(lidoReferral) {}
         catch (bytes memory reason) {
             revert CollateralYieldZapper__StEthSubmitFailed(reason);
         }

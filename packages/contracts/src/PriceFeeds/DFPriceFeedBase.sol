@@ -11,7 +11,7 @@ import "./MainnetPriceFeedBase.sol";
  * @notice DeltaForesight base for "Standard" JPY-denominated price feeds.
  * @dev Inherits the upstream-derived `MainnetPriceFeedBase` (its USD price
  *      machinery — Chainlink fetch, 18-decimal scaling, gas-griefing guard,
- *      `PriceSource` state, `lastGoodPrice`, shutdown — remains the shared
+ *      `PriceSource` state, `lastGoodPrice`, temporary shutdown — remains the shared
  *      acquisition path, with the documented Chainlink response-validation hardening)
  *      and adds, in this NEW file only:
  *        - a shared JPY/USD rate provider (`jpyUsdRateProvider`), and
@@ -36,7 +36,7 @@ abstract contract DFPriceFeedBase is MainnetPriceFeedBase {
     error InvalidJpyUsdRateProvider();
 
     // All branch feeds point to the same provider contract, so the cached JPY rate,
-    // freeze onset, recovery, and terminal expiration cannot diverge per branch.
+    // freeze onset, recovery, and bounded expiration cannot diverge per branch.
     IJpyUsdRateProvider public immutable jpyUsdRateProvider;
 
     // CollateralVault that accounts for dToken backing. The price feed only reads
@@ -66,10 +66,11 @@ abstract contract DFPriceFeedBase is MainnetPriceFeedBase {
     }
 
     function fetchPrice() public returns (uint256, bool) {
-        // If the branch is live and the primary oracle setup has been working, use it.
+        // Oracle shutdown is recoverable, so keep probing the primary source. Before validated
+        // resume, the registered PriceFeedProxy still gates normal redemption and risk increases.
         if (priceSource == PriceSource.primary) return _fetchPricePrimary();
 
-        // Otherwise the branch is shut down and pinned to lastGoodPrice.
+        // Retained for compatibility with a source deployed in the legacy terminal state.
         assert(priceSource == PriceSource.lastGoodPrice);
         return (lastGoodPrice, false);
     }
@@ -79,11 +80,20 @@ abstract contract DFPriceFeedBase is MainnetPriceFeedBase {
         return fetchPrice();
     }
 
+    function fetchUrgentRedemptionPrice() external virtual returns (uint256, bool) {
+        // Standard feeds use their live normal quote, but never the terminal source cache,
+        // for urgent settlement.
+        if (priceSource == PriceSource.primary) return _fetchPricePrimary();
+
+        assert(priceSource == PriceSource.lastGoodPrice);
+        return (lastGoodPrice, true);
+    }
+
     /**
      * @dev Standard primary path: collateral/USD (upstream Chainlink machinery) →
      *      collateral/JPY (DF conversion) → backing-adjusted dToken/JPY.
      *      Returns (price, newOracleFailureDetected).
-     *      Collateral/USD failure shuts down the branch and pins lastGoodPrice.
+     *      Collateral/USD failure temporarily shuts down the branch and returns lastGoodPrice.
      *      JPY/USD failure soft-freezes on lastGoodJpyRate for a bounded period;
      *      if the freeze exceeds MAX_JPY_FREEZE_DURATION, the branch shuts down
      *      and signals newOracleFailureDetected.
@@ -99,18 +109,16 @@ abstract contract DFPriceFeedBase is MainnetPriceFeedBase {
         // reused as the collateral/USD aggregator.
         (uint256 collUsdPrice, bool collUsdOracleDown) = _getOracleAnswer(ethUsdOracle);
         if (collUsdOracleDown) {
-            return (_shutDownAndSwitchToLastGoodPrice(address(ethUsdOracle.aggregator)), true);
+            return (_shutDownAndReturnLastGoodPrice(address(ethUsdOracle.aggregator)), true);
         }
 
         // JPY/USD is a SHARED systemic leg used by EVERY branch's conversion. Unlike the
-        // per-branch collateral/USD oracle above, a JPY-leg failure must NOT terminally shut
-        // the branch down: doing so would convert an isolated, per-branch fail-safe into a
-        // single point of total failure that simultaneously and permanently shuts down all
-        // branches. Instead the feed substitutes the last good JPY rate and keeps operating.
+        // per-branch collateral/USD oracle above, a JPY-leg failure must not synchronously stop
+        // every branch. Instead the feed substitutes the last good JPY rate and keeps operating.
         // The collateral/USD leg is still live here, so the price continues to track the
         // (high-volatility) collateral; only the (low-volatility) FX leg is frozen. The branch
         // auto-resumes the live rate as soon as JPY/USD is fresh again. If the outage outlives
-        // the bounded freeze window, fall back to the normal branch shutdown path so the feed
+        // the bounded freeze window, enter recoverable oracle shutdown so the feed
         // never serves an arbitrarily stale FX rate (Oracle.md ORCL-SEC-005).
         (uint256 collJpyPrice, bool jpyFreezeExpired) = _convertUsdPriceToJpyWithFreeze(collUsdPrice);
         if (jpyFreezeExpired) {
@@ -119,7 +127,7 @@ abstract contract DFPriceFeedBase is MainnetPriceFeedBase {
 
         (uint256 dTokenJpyPrice, bool backingUnavailable) = _applyBackingRatio(collJpyPrice);
         if (backingUnavailable) {
-            return (_shutDownAndSwitchToLastGoodPrice(collateralVault), true);
+            return (_shutDownAndReturnLastGoodPrice(collateralVault), true);
         }
 
         lastGoodPrice = dTokenJpyPrice;
@@ -139,14 +147,7 @@ abstract contract DFPriceFeedBase is MainnetPriceFeedBase {
 
     /// @dev Shared-JPY-failure shutdown; see `JpyFreezeLib.shutDownFromSharedJpyFailure`.
     function _shutDownFromSharedJpyFailure() internal returns (uint256) {
-        // Latch the terminal source state only when the branch was actually shut down. Staying
-        // on `primary` is safe: while the oracle remains unhealthy, the provider re-reports
-        // failure=true until the registered caller acts on it. A later fresh response starts a
-        // new provider episode, but cannot reactivate a branch that already latched shutdown.
-        // See test/JpySharedShutdownLatch.t.sol.
-        if (JpyFreezeLib.shutDownFromSharedJpyFailure(borrowerOperations, jpyUsdRateProvider)) {
-            priceSource = PriceSource.lastGoodPrice;
-        }
+        JpyFreezeLib.shutDownFromSharedJpyFailure(borrowerOperations, jpyUsdRateProvider);
         return lastGoodPrice;
     }
 

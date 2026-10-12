@@ -22,6 +22,7 @@ contract TroveManager is LiquityBase, ITroveManager, ITroveEvents {
 
     // --- Connected contract declarations ---
 
+    IAddressesRegistry internal immutable addressesRegistry;
     ITroveNFT public troveNFT;
     IBorrowerOperations public borrowerOperations;
     IStabilityPool public stabilityPool;
@@ -35,18 +36,18 @@ contract TroveManager is LiquityBase, ITroveManager, ITroveEvents {
     IWETH internal immutable WETH;
 
     // Critical system collateral ratio. If the system's total collateral ratio (TCR) falls below the CCR, some borrowing operation restrictions are applied
-    uint256 public immutable CCR;
+    uint256 public CCR;
 
     // Minimum collateral ratio for individual troves
-    uint256 internal immutable MCR;
+    uint256 internal MCR;
     // Shutdown system collateral ratio. If the system's total collateral ratio (TCR) for a given collateral falls below the SCR,
     // the protocol triggers the shutdown of the borrow market and permanently disables all borrowing operations except for closing Troves.
-    uint256 internal immutable SCR;
+    uint256 internal SCR;
 
     // Liquidation penalty for troves offset to the SP
-    uint256 internal immutable LIQUIDATION_PENALTY_SP;
+    uint256 internal LIQUIDATION_PENALTY_SP;
     // Liquidation penalty for troves redistributed
-    uint256 internal immutable LIQUIDATION_PENALTY_REDISTRIBUTION;
+    uint256 internal LIQUIDATION_PENALTY_REDISTRIBUTION;
 
     // --- Data structures ---
 
@@ -192,6 +193,7 @@ contract TroveManager is LiquityBase, ITroveManager, ITroveEvents {
     event CollateralRegistryAddressChanged(address _collateralRegistryAddress);
 
     constructor(IAddressesRegistry _addressesRegistry) LiquityBase(_addressesRegistry) {
+        addressesRegistry = _addressesRegistry;
         CCR = _addressesRegistry.CCR();
         MCR = _addressesRegistry.MCR();
         SCR = _addressesRegistry.SCR();
@@ -216,6 +218,22 @@ contract TroveManager is LiquityBase, ITroveManager, ITroveEvents {
         emit JpydfTokenAddressChanged(address(jpydfToken));
         emit SortedTrovesAddressChanged(address(sortedTroves));
         emit CollateralRegistryAddressChanged(address(collateralRegistry));
+    }
+
+    function syncRiskParams(
+        uint256 _ccr,
+        uint256 _mcr,
+        uint256 _scr,
+        uint256 _liquidationPenaltySP,
+        uint256 _liquidationPenaltyRedistribution
+    ) external override {
+        require(msg.sender == address(addressesRegistry));
+
+        CCR = _ccr;
+        MCR = _mcr;
+        SCR = _scr;
+        LIQUIDATION_PENALTY_SP = _liquidationPenaltySP;
+        LIQUIDATION_PENALTY_REDISTRIBUTION = _liquidationPenaltyRedistribution;
     }
 
     // --- Getters ---
@@ -431,7 +449,8 @@ contract TroveManager is LiquityBase, ITroveManager, ITroveEvents {
         TroveChange memory troveChange;
         LiquidationValues memory totals;
 
-        (uint256 price,) = priceFeed.fetchPrice();
+        (uint256 price, bool oracleFailure) = priceFeed.fetchPrice();
+        if (oracleFailure) return;
 
         // - If the SP has total deposits >= 1e18, we leave 1e18 in it untouched.
         // - If it has 0 < x < 1e18 total deposits, we leave x in it.
@@ -779,7 +798,8 @@ contract TroveManager is LiquityBase, ITroveManager, ITroveEvents {
         vars.lastBatchUpdatedInterest = address(0);
 
         // Get the price to use for the redemption collateral calculations
-        (uint256 redemptionPrice,) = priceFeed.fetchRedemptionPrice();
+        (uint256 redemptionPrice, bool oracleFailure) = priceFeed.fetchRedemptionPrice();
+        if (oracleFailure) return 0;
 
         // Loop through the Troves starting from the one with lowest interest rate until _amount of JPYDF is exchanged for collateral
         if (_maxIterations == 0) _maxIterations = type(uint256).max;
@@ -886,8 +906,9 @@ contract TroveManager is LiquityBase, ITroveManager, ITroveEvents {
         IActivePool activePoolCached = activePool;
         TroveChange memory totalsTroveChange;
 
-        // Use the standard fetchPrice here, since if branch has shut down we don't worry about small redemption arbs
-        (uint256 price,) = priceFeed.fetchPrice();
+        // Use the wind-down quote so an irreversible shutdown does not reopen the
+        // normal-redemption oracle-lag arbitrage.
+        (uint256 price,) = priceFeed.fetchUrgentRedemptionPrice();
 
         uint256 remainingJpydf = _jpydfAmount;
         for (uint256 i = 0; i < _troveIds.length; i++) {
@@ -1226,10 +1247,11 @@ contract TroveManager is LiquityBase, ITroveManager, ITroveEvents {
         uint256 spSize = stabilityPool.getTotalJpydfDeposits();
         uint256 unbackedPortion = totalDebt > spSize ? totalDebt - spSize : 0;
 
-        (uint256 price,) = priceFeed.fetchPrice();
+        (uint256 price, bool oracleFailure) = priceFeed.fetchPrice();
         // It's redeemable if the TCR is above the shutdown threshold, and branch has not been shut down.
         // Use the normal price for the TCR check.
-        bool redeemable = _getTCR(price) >= SCR && shutdownTime == 0;
+        bool redeemable = !oracleFailure && !borrowerOperations.isOracleFailureShutdown() && _getTCR(price) >= SCR
+            && shutdownTime == 0;
 
         return (unbackedPortion, price, redeemable);
     }
@@ -1506,8 +1528,7 @@ contract TroveManager is LiquityBase, ITroveManager, ITroveEvents {
         // assert(closedStatus == Status.closedByLiquidation || closedStatus == Status.closedByOwner);
 
         uint256 TroveIdsArrayLength = TroveIds.length;
-        // If branch has not been shut down, or it's a liquidation,
-        // require at least 1 trove in the system
+        // If branch has not been shut down, or it's a liquidation, require at least 1 trove in the system.
         if (shutdownTime == 0 || closedStatus == Status.closedByLiquidation) {
             _requireMoreThanOneTroveInSystem(TroveIdsArrayLength);
         }

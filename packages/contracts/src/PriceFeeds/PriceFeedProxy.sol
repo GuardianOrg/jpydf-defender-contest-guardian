@@ -6,14 +6,19 @@ import {Ownable2Step} from "openzeppelin-contracts/contracts/access/Ownable2Step
 
 import "../Interfaces/IPriceFeedProxy.sol";
 import "../Interfaces/IBorrowerOperations.sol";
+import "../Interfaces/IJpyUsdRateProvider.sol";
 // Imported only to bind the gas-griefing guard selector to upstream at COMPILE time
 // (see _bubbleIfGasError). No core file is modified by importing it.
 import {MainnetPriceFeedBase} from "./MainnetPriceFeedBase.sol";
 
+interface IJpyUsdRateProviderSource {
+    function jpyUsdRateProvider() external view returns (IJpyUsdRateProvider);
+}
+
 /**
  * @title PriceFeedProxy
  * @notice Swappable-source price feed: a fixed reference address whose underlying price
- *         source is switchable behind a 24h timelock. NOT a UUPS / delegatecall / storage
+ *         source is switchable behind a 12h timelock. NOT a UUPS / delegatecall / storage
  *         proxy and not upgradeable in the storage sense — "proxy" here means indirection.
  * @dev Allows switching between different price feed sources without redeploying
  *      the protocol. The DF protocol should reference this proxy address, never
@@ -48,8 +53,9 @@ import {MainnetPriceFeedBase} from "./MainnetPriceFeedBase.sol";
  *        old source is unhealthy. Incident recovery / placeholder activation can use
  *        confirmSourceEmergency() to bypass only that price-jump guard after the same
  *        timelock and new-source smoke tests.
- *      - confirmSource smoke-tests the new source and re-initialises the cached price,
- *        so a post-switch source failure never serves the old source's stale price.
+ *      - confirmSource smoke-tests the new source, always re-initialises the normal cache,
+ *        and re-initialises the redemption cache only from fresh JPY provenance. An aged
+ *        source cannot replace that cache and any later fallback is returned with failure=true.
  *      - Owner can cancel a pending proposal at any time.
  *
  *      Ownership:
@@ -66,9 +72,14 @@ contract PriceFeedProxy is IPriceFeedProxy, Ownable2Step {
     // --- Constants ---
 
     /// @notice Minimum delay before a proposed source can be confirmed.
-    uint256 public constant TIMELOCK_DELAY = 24 hours;
+    uint256 public constant TIMELOCK_DELAY = 12 hours;
+    uint256 public constant MAX_NORMAL_REDEMPTION_JPY_AGE = 30 hours;
     uint256 public constant MAX_SOURCE_SWITCH_DEVIATION_BPS = 100; // 1%
     uint256 private constant BPS_DENOMINATOR = 10_000;
+    uint8 private constant JPY_PROVENANCE_INVALID = 0;
+    uint8 private constant JPY_PROVENANCE_FRESH = 1;
+    uint8 private constant JPY_PROVENANCE_AGED = 2;
+    uint256 private constant JPY_PROVENANCE_GAS_STIPEND = 30_000;
 
     // --- State ---
 
@@ -89,8 +100,10 @@ contract PriceFeedProxy is IPriceFeedProxy, Ownable2Step {
 
     struct SourceRead {
         bool healthy;
+        bool redemptionPriceCacheable;
         uint256 price;
         uint256 redemptionPrice;
+        uint256 urgentRedemptionPrice;
     }
 
     /**
@@ -105,25 +118,28 @@ contract PriceFeedProxy is IPriceFeedProxy, Ownable2Step {
         // system-wide since CollateralRegistry.redeemCollateral reads every branch unguarded.
         //
         // Scope of THIS guard (code.length): it blocks ONLY non-contract sources
-        // (address(0) / EOA). It is not the full validity check — two further screens run below:
-        //   - a deployed source that *reverts* on a live fetch is intentionally allowed: the
-        //     F-01 warm just below uses the lastGoodPrice() view (not fetchPrice()), and the
-        //     runtime try/catch in fetchPrice()/fetchRedemptionPrice() handles a reverting
-        //     source and falls back to lastGoodPrice;
+        // (address(0) / EOA). It is not the full validity check — further screens run below:
+        //   - a direct source exposing the PriceFeedProxy `source()` getter marker is rejected.
+        //     This is a shallow type screen only; semantic forwarding and dependency cycles
+        //     remain part of deployment and timelocked source-change review;
+        //   - a deployed source that reverts on a cache-backed normal/redemption fetch is
+        //     intentionally allowed: the F-01 warm just below uses the lastGoodPrice() view,
+        //     and those runtime paths catch the revert and fall back to lastGoodPrice. The
+        //     cache-free urgent fetch must succeed in the C-2 smoke-test below;
         //   - a deployed source that returns *mis-encoded* (wrong-ABI) data, an invalid (0/max)
         //     price, or a failure-flagged (oracleFailure==true) result is rejected — not here,
         //     but by the C-2 smoke-test at the end of this constructor (a wrong-ABI decode
         //     failure pierces try/catch; an invalid/failure-flagged success return is rejected
         //     explicitly), so it can never be set as an initial source that would brick or shut
-        //     down the branch on its first fetch. A merely-reverting source is still tolerated
-        //     there (empty catch), so a temporarily-reverting-but-valid feed is not wrongly
-        //     rejected.
-        // What stays the owner's responsibility (operationally, via Ownable2Step + the 24h
+        //     down the branch on its first fetch. A merely-reverting normal/redemption path is
+        //     still tolerated there, while an urgent-path revert is rejected.
+        // What stays the owner's responsibility (operationally, via Ownable2Step + the 12h
         // source-swap timelock — no on-chain check can verify it) is the source's *semantic*
         // honesty: returning a truthful, correctly-scaled price.
         if (_initialSource.code.length == 0) revert InvalidSource();
         if (_ownerAddress == address(0)) revert ZeroOwnerAddress();
         if (_borrowerOperations == address(0)) revert InvalidAddress();
+        if (_isPriceFeedProxy(_initialSource)) revert InvalidSource();
 
         // Ownable's constructor already set owner to deployer; re-target to the
         // desired initial owner. Emits a second OwnershipTransferred event.
@@ -139,38 +155,47 @@ contract PriceFeedProxy is IPriceFeedProxy, Ownable2Step {
         // PriceFeedProxySourceValidation.t.sol), while a zero / bricked source is rejected at
         // deploy (fail-closed) instead of silently returning 0 to a downstream divisor
         // (TroveManager redemption divides jpydfLot by the redemption price).
+        uint256 initialRedemptionPrice;
         try IPriceFeed(_initialSource).lastGoodPrice() returns (uint256 initPrice) {
             if (_isInvalidPrice(initPrice)) revert InvalidSource();
             _lastGoodPrice = initPrice;
-            _lastGoodRedemptionPrice = initPrice;
+            initialRedemptionPrice = initPrice;
         } catch {
             revert InvalidSource();
         }
 
-        // C-2: smoke-test BOTH fetch entrypoints the protocol reads with no try/catch (fetchPrice
+        // C-2: smoke-test all fetch entrypoints the protocol reads with no try/catch (fetchPrice
         // via getUnbackedPortion...; fetchRedemptionPrice via RedemptionHelper / TroveManager
         // redemption math), and validate the SUCCESS-path result fail-closed — exactly as
         // confirmSource does at switch time. On a decodable, non-reverting return, reject a 0/max
         // sentinel OR an oracleFailure==true flag with InvalidSource. That revert fires inside the
-        // success body which — like a return-data decode failure — is NOT caught by the empty
-        // catch and so reverts the constructor. This rejects, at DEPLOY, an initial source that is
-        // already failing or would serve an invalid price, instead of letting the branch shut
-        // itself down (or, under a deploy miswire, stay live on a frozen price) on its first fetch.
+        // success body which — like a return-data decode failure — is not caught by these external
+        // call catches and so reverts the constructor. This rejects, at DEPLOY, an initial source
+        // that is already failing or would serve an invalid price, instead of letting the branch
+        // shut itself down (or, under a deploy miswire, stay live on a frozen price) on its first
+        // fetch.
         //
-        // Still tolerated (empty catch): a source whose live fetch *reverts* — the F-01 warm above
-        // used the lastGoodPrice() view, and the runtime try/catch in
-        // fetchPrice()/fetchRedemptionPrice() handles a temporarily-reverting-but-valid feed (see
-        // PriceFeedProxySourceValidation.t.sol). A *wrong-ABI* (mis-encoded) source's decode
-        // failure still PIERCES try/catch and reverts here. Now fully symmetric with confirmSource
-        // (value + flag), not just on decodability.
+        // Still tolerated (empty catch) for the cache-backed normal and redemption paths: a source
+        // whose live fetch reverts can be served from the F-01 cache at runtime. Urgent redemption
+        // has no cache by design, so its probe must succeed at construction. A wrong-ABI source's
+        // decode failure still pierces try/catch and reverts here.
         try IPriceFeed(_initialSource).fetchPrice() returns (uint256 fp, bool fpFailure) {
             if (_isInvalidPrice(fp) || fpFailure) revert InvalidSource();
             _lastGoodPrice = fp;
         } catch {}
         try IPriceFeed(_initialSource).fetchRedemptionPrice() returns (uint256 rp, bool rpFailure) {
             if (_isInvalidPrice(rp) || rpFailure) revert InvalidSource();
-            _lastGoodRedemptionPrice = rp;
+            initialRedemptionPrice = rp;
         } catch {}
+        try IPriceFeed(_initialSource).fetchUrgentRedemptionPrice() returns (uint256 up, bool upFailure) {
+            if (_isInvalidPrice(up) || upFailure) revert InvalidSource();
+        } catch (bytes memory err) {
+            _bubbleIfGasError(err);
+            revert InvalidSource();
+        }
+
+        if (_normalRedemptionJpyStatus(_initialSource) != JPY_PROVENANCE_FRESH) revert InvalidSource();
+        _lastGoodRedemptionPrice = initialRedemptionPrice;
 
         emit SourceUpdated(address(0), _initialSource);
     }
@@ -182,13 +207,13 @@ contract PriceFeedProxy is IPriceFeedProxy, Ownable2Step {
     /// @inheritdoc IPriceFeed
     function fetchPrice() external returns (uint256, bool) {
         try IPriceFeed(source).fetchPrice() returns (uint256 price, bool oracleFailure) {
-            // F-02: a source that signals failure via the bool (instead of reverting) must still
-            // trigger the proxy's own shutdown. Otherwise the branch stays live on a price the
-            // source flagged unreliable, since redemption/liquidation ignore this second return
-            // value (only borrowing consumes it). _handleFailedFetch still returns (price, true).
+            // A source-signalled failure follows the same temporary shutdown path as a revert.
             if (_isInvalidPrice(price) || oracleFailure) return _handleFailedFetch(false);
             _lastGoodPrice = price;
-            return (price, oracleFailure);
+            // A recovered live normal price may be used before owner resume for liquidation,
+            // the TCR<SCR check, and risk-reducing borrower adjustments. Risk increases and
+            // normal redemption remain gated by the latched shutdown flag.
+            return (price, false);
         } catch (bytes memory err) {
             _bubbleIfGasError(err);
             return _handleFailedFetch(false);
@@ -200,17 +225,39 @@ contract PriceFeedProxy is IPriceFeedProxy, Ownable2Step {
         try IPriceFeed(source).fetchRedemptionPrice() returns (uint256 price, bool oracleFailure) {
             // F-02: see fetchPrice(). Route a failure-flagged-but-valid price through shutdown too.
             if (_isInvalidPrice(price) || oracleFailure) return _handleFailedFetch(true);
+
+            // Stop only normal redemption once the shared JPY/USD round reaches 30h old.
+            // The source call comes first so the first fresh round refreshes provenance and
+            // reopens redemption automatically. This local gate deliberately does not invoke
+            // _handleFailedFetch: borrowing, liquidation and urgent redemption remain unchanged.
+            if (_normalRedemptionJpyStatus(source) != JPY_PROVENANCE_FRESH) return (price, true);
+
             _lastGoodRedemptionPrice = price;
-            return (price, oracleFailure);
+            // A latched BO pause keeps normal redemption closed until the owner validates all
+            // three price paths; the JPY-age gate above independently requires fresh provenance.
+            return (price, borrowerOperations.isOracleFailureShutdown());
         } catch (bytes memory err) {
             _bubbleIfGasError(err);
             return _handleFailedFetch(true);
         }
     }
 
+    /// @inheritdoc IPriceFeed
+    function fetchUrgentRedemptionPrice() external returns (uint256, bool) {
+        try IPriceFeed(source).fetchUrgentRedemptionPrice() returns (uint256 price, bool oracleFailure) {
+            // Wind-down must never settle against a normal-path cache. There is deliberately
+            // no third cache: only a source-policy-valid urgent quote is accepted.
+            if (_isInvalidPrice(price) || oracleFailure) revert UrgentRedemptionPriceUnavailable(source);
+            return (price, false);
+        } catch (bytes memory err) {
+            _bubbleIfGasError(err);
+            revert UrgentRedemptionPriceUnavailable(source);
+        }
+    }
+
     /**
      * @dev Handles the case where the underlying feed reverted or returned an invalid price.
-     *      Triggers branch shutdown, then tries to read lastGoodPrice from the source.
+     *      Triggers temporary oracle-failure shutdown, then tries to read lastGoodPrice from the source.
      *      For the normal path, a valid source.lastGoodPrice() can refresh the proxy cache.
      *      For the redemption path, lastGoodPrice() is not path-specific, so the proxy only
      *      serves its own last known redemption price. This prevents a failing source with
@@ -250,6 +297,20 @@ contract PriceFeedProxy is IPriceFeedProxy, Ownable2Step {
         return (_lastGoodPrice, true);
     }
 
+    /// @inheritdoc IPriceFeedProxy
+    function resumeFromOracleFailure() external onlyOwner {
+        if (!borrowerOperations.isOracleFailureShutdown()) revert OracleFailureShutdownNotActive();
+
+        SourceRead memory read = _readSourceIfHealthy(source);
+        if (!read.healthy) revert SourceNotHealthy();
+
+        _lastGoodPrice = read.price;
+        if (read.redemptionPriceCacheable) _lastGoodRedemptionPrice = read.redemptionPrice;
+        borrowerOperations.resumeFromOracleFailure();
+
+        emit OracleFailureShutdownResumed(source, read.price, read.redemptionPrice);
+    }
+
     /**
      * @dev Returns true if price is zero or max uint256 (sentinel/invalid values).
      */
@@ -287,18 +348,20 @@ contract PriceFeedProxy is IPriceFeedProxy, Ownable2Step {
 
     // =========================================================
     //  Timelocked source switching
-    //  (timelock guarantees 24h public notice; it does NOT by itself eliminate price-jump
+    //  (timelock guarantees 12h public notice; it does NOT by itself eliminate price-jump
     //   MEV at the confirmSource block — submit confirmSource privately when prices may differ)
     // =========================================================
 
     /// @inheritdoc IPriceFeedProxy
     function proposeSource(address _newSource) external onlyOwner {
         // Reject non-contract sources (address(0) / EOA): a no-code source makes the
-        // proxy's fetch revert un-catchably and DoS all redemptions. This screens only
-        // non-contract sources; the ABI-correctness of a code-bearing feed remains the
-        // owner's responsibility under the timelock (see constructor note for scope).
+        // proxy's fetch revert un-catchably and DoS all redemptions. A source exposing the
+        // PriceFeedProxy `source()` marker is also rejected as a shallow direct-proxy screen.
+        // It does not traverse semantic forwarding or prove dependency-graph acyclicity; those
+        // checks remain the owner's responsibility under the timelock (see constructor note).
         if (_newSource.code.length == 0) revert InvalidSource();
         if (_newSource == source) revert SameSource();
+        if (_isPriceFeedProxy(_newSource)) revert InvalidSource();
 
         // If overwriting a pending proposal, emit cancellation for the old one
         if (proposedSource != address(0)) {
@@ -329,17 +392,26 @@ contract PriceFeedProxy is IPriceFeedProxy, Ownable2Step {
         if (proposedSource.code.length == 0) revert InvalidSource();
         // Redundant with proposeSource's check, but keeps confirm self-contained.
         if (proposedSource == source) revert SameSource();
+        // Re-check the shallow direct-proxy marker after the timelock so proposal-time
+        // classification cannot be bypassed by changed code or corrupted pending state.
+        // This marker does not traverse forwarding dependencies or prove acyclicity.
+        if (_isPriceFeedProxy(proposedSource)) revert InvalidSource();
 
         address oldSource = source;
-        SourceRead memory oldRead = _readSourceIfHealthy(oldSource);
+        SourceRead memory oldRead;
+        // The emergency path is the recovery route for a broken source. Do not call that
+        // source here: it may consume all forwarded gas and otherwise make itself impossible
+        // to replace. The validated proxy caches remain the continuity reference for the event.
+        if (!_bypassPriceGuard) oldRead = _readSourceIfHealthy(oldSource);
 
         // F-03 / F-06: smoke-test the new source so the switch fails CLOSED if the new source
         // cannot serve a valid, ABI-decodable price *right now*. A reverting source reverts here;
         // a mis-encoded (wrong-ABI) source's return-data decode failure pierces try/catch and
         // also reverts here — both reject the switch instead of bricking redemption later
         // (CollateralRegistry.redeemCollateral reads every branch's feed with no try/catch).
-        // Re-initialise the cache to the NEW source's price so a post-switch failure never serves
-        // the OLD source's (possibly wrong-scale, e.g. placeholder→real) price.
+        // Re-initialise the normal cache to the NEW source. Re-initialise the redemption cache
+        // only from fresh JPY provenance; an aged source cannot replace the last fresh quote,
+        // and any later fallback is returned with failure=true so consumers cannot settle on it.
         (uint256 newPrice, bool newOracleFailure) = IPriceFeed(proposedSource).fetchPrice();
         // Reject an invalid price AND a live-but-failing source (valid price + oracleFailure==true
         // without reverting) — consistent with fetchPrice's F-02 handling, so confirm only accepts
@@ -351,9 +423,15 @@ contract PriceFeedProxy is IPriceFeedProxy, Ownable2Step {
         // redemptions. A wrong-ABI return-data decode failure pierces try/catch and reverts here.
         (uint256 newRedemptionPrice, bool newRedemptionFailure) = IPriceFeed(proposedSource).fetchRedemptionPrice();
         if (_isInvalidPrice(newRedemptionPrice) || newRedemptionFailure) revert InvalidSource();
+        (uint256 newUrgentRedemptionPrice, bool newUrgentRedemptionFailure) =
+            IPriceFeed(proposedSource).fetchUrgentRedemptionPrice();
+        if (_isInvalidPrice(newUrgentRedemptionPrice) || newUrgentRedemptionFailure) revert InvalidSource();
 
         uint256 referencePrice = oldRead.healthy ? oldRead.price : _lastGoodPrice;
-        uint256 referenceRedemptionPrice = oldRead.healthy ? oldRead.redemptionPrice : _lastGoodRedemptionPrice;
+        uint256 referenceRedemptionPrice =
+            oldRead.healthy && oldRead.redemptionPriceCacheable ? oldRead.redemptionPrice : _lastGoodRedemptionPrice;
+        uint256 referenceUrgentRedemptionPrice =
+            oldRead.healthy ? oldRead.urgentRedemptionPrice : _lastGoodRedemptionPrice;
 
         // Normal confirmation never becomes an implicit emergency path merely because the old
         // source failed between proposal and execution. The proxy caches are initialized and
@@ -363,10 +441,10 @@ contract PriceFeedProxy is IPriceFeedProxy, Ownable2Step {
         if (!_bypassPriceGuard) {
             _requireWithinSwitchDeviation(referencePrice, newPrice);
             _requireWithinSwitchDeviation(referenceRedemptionPrice, newRedemptionPrice);
+            _requireWithinSwitchDeviation(referenceUrgentRedemptionPrice, newUrgentRedemptionPrice);
         }
 
-        _lastGoodPrice = newPrice;
-        _lastGoodRedemptionPrice = newRedemptionPrice;
+        _cacheConfirmedSourcePrices(proposedSource, newPrice, newRedemptionPrice);
 
         source = proposedSource;
 
@@ -401,7 +479,54 @@ contract PriceFeedProxy is IPriceFeedProxy, Ownable2Step {
             return read;
         }
 
+        try IPriceFeed(_source).fetchUrgentRedemptionPrice() returns (uint256 urgentPrice, bool oracleFailure) {
+            if (_isInvalidPrice(urgentPrice) || oracleFailure) return read;
+            read.urgentRedemptionPrice = urgentPrice;
+        } catch {
+            return read;
+        }
+
+        uint8 jpyProvenance = _normalRedemptionJpyStatus(_source);
+        read.redemptionPriceCacheable = jpyProvenance == JPY_PROVENANCE_FRESH;
         read.healthy = true;
+    }
+
+    /// @dev Validate the source-bound provider and classify the normal-redemption age gate.
+    ///      Fixed-size return buffers keep malformed runtime provenance and oversized returndata
+    ///      local to normal redemption without copying attacker-controlled return lengths.
+    function _normalRedemptionJpyStatus(address _source) private view returns (uint8) {
+        (bool sourceOk, uint256 encodedProvider) =
+            _staticcallWord(_source, IJpyUsdRateProviderSource.jpyUsdRateProvider.selector);
+        if (!sourceOk) return JPY_PROVENANCE_INVALID;
+        if (encodedProvider > type(uint160).max) return JPY_PROVENANCE_INVALID;
+        address provider = address(uint160(encodedProvider));
+        if (provider.code.length == 0) return JPY_PROVENANCE_INVALID;
+
+        (bool providerOk, uint256 updatedAt) =
+            _staticcallWord(provider, IJpyUsdRateProvider.lastGoodJpyUpdatedAt.selector);
+        if (!providerOk) return JPY_PROVENANCE_INVALID;
+        if (updatedAt == 0 || updatedAt > block.timestamp) return JPY_PROVENANCE_INVALID;
+        return block.timestamp - updatedAt >= MAX_NORMAL_REDEMPTION_JPY_AGE ? JPY_PROVENANCE_AGED : JPY_PROVENANCE_FRESH;
+    }
+
+    function _staticcallWord(address _target, bytes4 _selector) private view returns (bool success, uint256 result) {
+        bytes memory callData = abi.encodeWithSelector(_selector);
+        uint256 stipend = JPY_PROVENANCE_GAS_STIPEND;
+        assembly {
+            let output := mload(0x40)
+            mstore(output, 0)
+            success := staticcall(stipend, _target, add(callData, 0x20), mload(callData), output, 0x20)
+            success := and(success, eq(returndatasize(), 0x20))
+            if success { result := mload(output) }
+        }
+    }
+
+    function _cacheConfirmedSourcePrices(address _source, uint256 _price, uint256 _redemptionPrice) private {
+        uint8 jpyProvenance = _normalRedemptionJpyStatus(_source);
+        if (jpyProvenance == JPY_PROVENANCE_INVALID) revert InvalidSource();
+
+        _lastGoodPrice = _price;
+        if (jpyProvenance == JPY_PROVENANCE_FRESH) _lastGoodRedemptionPrice = _redemptionPrice;
     }
 
     function _requireWithinSwitchDeviation(uint256 _oldPrice, uint256 _newPrice) internal pure {
@@ -411,6 +536,12 @@ contract PriceFeedProxy is IPriceFeedProxy, Ownable2Step {
         if (delta > maxDelta) {
             revert SourcePriceDeviationTooLarge(_oldPrice, _newPrice, MAX_SOURCE_SWITCH_DEVIATION_BPS);
         }
+    }
+
+    function _isPriceFeedProxy(address _candidate) private view returns (bool) {
+        (bool success, bytes memory result) =
+            _candidate.staticcall(abi.encodeWithSelector(IPriceFeedProxy.source.selector));
+        return success && result.length == 32;
     }
 
     /// @inheritdoc IPriceFeedProxy

@@ -20,6 +20,7 @@ contract BorrowerOperations is LiquityBase, AddRemoveManagers, IBorrowerOperatio
 
     // --- Connected contract declarations ---
 
+    IAddressesRegistry internal immutable addressesRegistry;
     IERC20 internal immutable collToken;
     ITroveManager internal troveManager;
     address internal gasPoolAddress;
@@ -31,18 +32,19 @@ contract BorrowerOperations is LiquityBase, AddRemoveManagers, IBorrowerOperatio
     IWETH internal immutable WETH;
 
     // Critical system collateral ratio. If the system's total collateral ratio (TCR) falls below the CCR, some borrowing operation restrictions are applied
-    uint256 public immutable CCR;
+    uint256 public CCR;
 
     // Shutdown system collateral ratio. If the system's total collateral ratio (TCR) for a given collateral falls below the SCR,
     // the protocol triggers the shutdown of the borrow market and permanently disables all borrowing operations except for closing Troves.
-    uint256 public immutable SCR;
+    uint256 public SCR;
     bool public hasBeenShutDown;
+    bool public isOracleFailureShutdown;
 
     // Minimum collateral ratio for individual troves
-    uint256 public immutable MCR;
+    uint256 public MCR;
 
     // Extra buffer of collateral ratio to join a batch or adjust a trove inside a batch (on top of MCR)
-    uint256 public immutable BCR;
+    uint256 public BCR;
 
     /*
     * Mapping from TroveId to individual delegate for interest rate setting.
@@ -155,6 +157,8 @@ contract BorrowerOperations is LiquityBase, AddRemoveManagers, IBorrowerOperatio
     error MinInterestRateChangePeriodTooLow();
     error NewOracleFailureDetected();
     error BatchSharesRatioTooLow();
+    error CallerNotAddressesRegistry();
+    error RiskParamsNotFinalized();
 
     event TroveManagerAddressChanged(address _newTroveManagerAddress);
     event GasPoolAddressChanged(address _gasPoolAddress);
@@ -171,6 +175,7 @@ contract BorrowerOperations is LiquityBase, AddRemoveManagers, IBorrowerOperatio
         // This makes impossible to open a trove with zero withdrawn JPYDF
         assert(MIN_DEBT > 0);
 
+        addressesRegistry = _addressesRegistry;
         collToken = _addressesRegistry.collToken();
 
         WETH = _addressesRegistry.WETH();
@@ -194,6 +199,15 @@ contract BorrowerOperations is LiquityBase, AddRemoveManagers, IBorrowerOperatio
 
         // Allow funds movements between Liquity contracts
         collToken.forceApprove(address(activePool), type(uint256).max);
+    }
+
+    function syncRiskParams(uint256 _ccr, uint256 _mcr, uint256 _bcr, uint256 _scr) external override {
+        if (msg.sender != address(addressesRegistry)) revert CallerNotAddressesRegistry();
+
+        CCR = _ccr;
+        MCR = _mcr;
+        BCR = _bcr;
+        SCR = _scr;
     }
 
     // --- Borrower Trove Operations ---
@@ -309,6 +323,7 @@ contract BorrowerOperations is LiquityBase, AddRemoveManagers, IBorrowerOperatio
         address _receiver,
         TroveChange memory _change
     ) internal returns (uint256) {
+        if (!addressesRegistry.riskParamsFinalized()) revert RiskParamsNotFinalized();
         _requireIsNotShutDown();
 
         LocalVariables_openTrove memory vars;
@@ -560,7 +575,10 @@ contract BorrowerOperations is LiquityBase, AddRemoveManagers, IBorrowerOperatio
         TroveChange memory _troveChange,
         uint256 _maxUpfrontFee
     ) internal {
-        _requireIsNotShutDown();
+        // During a recoverable oracle pause, only collateral additions and debt repayments may reach the live-price check.
+        if ((_troveChange.collDecrease | _troveChange.debtIncrease) != 0 || hasBeenShutDown) {
+            _requireIsNotShutDown();
+        }
 
         LocalVariables_adjustTrove memory vars;
         vars.activePool = activePool;
@@ -717,9 +735,11 @@ contract BorrowerOperations is LiquityBase, AddRemoveManagers, IBorrowerOperatio
             // troveChange.newWeightedRecordedDebt = 0;
         }
 
-        (uint256 price,) = priceFeed.fetchPrice();
-        uint256 newTCR = _getNewTCRFromTroveChange(troveChange, price);
-        if (!hasBeenShutDown) _requireNewTCRisAboveCCR(newTCR);
+        if (!hasBeenShutDown) {
+            (uint256 price, bool oracleFailure) = priceFeed.fetchPrice();
+            if (oracleFailure) revert NewOracleFailureDetected();
+            _requireNewTCRisAboveCCR(_getNewTCRFromTroveChange(troveChange, price));
+        }
 
         troveManagerCached.onCloseTrove(
             _troveId,
@@ -1239,14 +1259,20 @@ contract BorrowerOperations is LiquityBase, AddRemoveManagers, IBorrowerOperatio
         _requireCallerIsPriceFeed();
 
         // No-op rather than revert here, so that the outer function call which fetches the price does not revert
-        // if the system is already shut down.
-        if (hasBeenShutDown) return;
+        // if the system is already in temporary or permanent shutdown.
+        if (hasBeenShutDown || isOracleFailureShutdown) return;
 
-        _applyShutdown();
+        isOracleFailureShutdown = true;
+    }
+
+    function resumeFromOracleFailure() external {
+        _requireCallerIsPriceFeed();
+        isOracleFailureShutdown = false;
     }
 
     function _applyShutdown() internal {
         activePool.mintAggInterest();
+        isOracleFailureShutdown = false;
         hasBeenShutDown = true;
         troveManager.shutdown();
     }
@@ -1308,7 +1334,7 @@ contract BorrowerOperations is LiquityBase, AddRemoveManagers, IBorrowerOperatio
     // --- 'Require' wrapper functions ---
 
     function _requireIsNotShutDown() internal view {
-        if (hasBeenShutDown) {
+        if (hasBeenShutDown || isOracleFailureShutdown) {
             revert IsShutDown();
         }
     }

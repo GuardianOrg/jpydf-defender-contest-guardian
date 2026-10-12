@@ -260,6 +260,7 @@ contract CollateralVault is
     {
         IERC20 u = _requireUnderlyingReady();
         if (_underlyingAmount == 0) revert ZeroAmount();
+        _requireConfirmedFullyBacked();
         uint256 vaultUnderlyingBeforeDeposit = u.balanceOf(address(this));
         u.safeTransferFrom(msg.sender, address(this), _underlyingAmount);
         uint256 received = u.balanceOf(address(this)) - vaultUnderlyingBeforeDeposit;
@@ -277,11 +278,7 @@ contract CollateralVault is
         whenNotPausedRedeem
         returns (uint256 underlyingReceived, uint256 requestId)
     {
-        _requireUnderlyingReady();
-        if (_dTokenAmount == 0) revert ZeroAmount();
-        if (_receiver == address(0)) revert ZeroAddress();
-
-        uint256 underlyingNeeded = _exactUnderlyingForRedemption(_dTokenAmount);
+        uint256 underlyingNeeded = _requireValidRedemption(_dTokenAmount, _receiver);
         uint256 bufferBal = bufferBalance();
 
         dToken.burn(msg.sender, _dTokenAmount);
@@ -301,11 +298,7 @@ contract CollateralVault is
         bytes32 _s,
         address _receiver
     ) external override nonReentrant whenNotPausedRedeem returns (uint256 underlyingReceived, uint256 requestId) {
-        _requireUnderlyingReady();
-        if (_dTokenAmount == 0) revert ZeroAmount();
-        if (_receiver == address(0)) revert ZeroAddress();
-
-        uint256 underlyingNeeded = _exactUnderlyingForRedemption(_dTokenAmount);
+        uint256 underlyingNeeded = _requireValidRedemption(_dTokenAmount, _receiver);
 
         _permitOrRequireAllowance(_dTokenAmount, _deadline, _v, _r, _s);
         IERC20(address(dToken)).safeTransferFrom(msg.sender, address(this), _dTokenAmount);
@@ -333,6 +326,7 @@ contract CollateralVault is
         if (req.claimed) return 0;
         if (block.timestamp < req.claimableAt) revert RequestNotReady();
 
+        _requireConfirmedFullyBacked();
         underlyingClaimed = req.underlyingAmount;
         if (bufferBalance() < underlyingClaimed) revert InsufficientBuffer();
 
@@ -388,6 +382,7 @@ contract CollateralVault is
             uint256 excess = bufferBefore - targetBuffer;
             if (excess > allocateMaxMove) excess = allocateMaxMove;
             _allocateToStrategies(excess);
+            if (excess != 0) _requireConfirmedFullyBacked();
         }
 
         lastAllocatorTime = block.timestamp;
@@ -894,13 +889,43 @@ contract CollateralVault is
         return userLiabilities + pendingWithdrawals;
     }
 
-    /// @dev Redeem must not silently burn dToken dust that cannot map to an
-    ///      underlying base unit. Minting only creates exact multiples, but ERC20
-    ///      transfers can split balances into non-redeemable dust.
-    function _exactUnderlyingForRedemption(uint256 _dTokenAmount) internal view returns (uint256 underlyingAmount) {
+    /// @dev User balance-sheet mutations require strict pre-state solvency.
+    ///      Unlike pricing views, this gate never accepts cached Strategy values;
+    ///      unavailable live values conservatively contribute zero.
+    function _requireConfirmedFullyBacked() internal view {
+        uint256 liabilities = _actualLiabilities();
+        if (liabilities == 0) return;
+
+        uint256 totalAssets = _rawUnderlyingBalance();
+        if (totalAssets >= liabilities) return;
+
+        uint256 strategyCount = strategies.length;
+        for (uint256 strategyIndex; strategyIndex < strategyCount; strategyIndex++) {
+            (,,,, uint256 conservativeValue, bool liveAvailable) = _liveStrategyValuation(strategies[strategyIndex]);
+            if (liveAvailable) {
+                if (conservativeValue >= liabilities - totalAssets) return;
+                totalAssets += conservativeValue;
+            }
+        }
+
+        revert BackingRatioBelowMinimum(Math.mulDiv(totalAssets, 1e18, liabilities), 1e18);
+    }
+
+    /// @dev Shared pre-state validation for both redemption entry points. Keeps
+    ///      the solvency check before permit, burn, queue mutation, and transfer.
+    ///      Also rejects dToken dust that cannot map to an underlying base unit.
+    function _requireValidRedemption(uint256 _dTokenAmount, address _receiver)
+        internal
+        view
+        returns (uint256 underlyingAmount)
+    {
+        _requireUnderlyingReady();
+        if (_dTokenAmount == 0) revert ZeroAmount();
+        if (_receiver == address(0)) revert ZeroAddress();
         underlyingAmount = dToken.convertToUnderlying(_dTokenAmount);
         if (underlyingAmount == 0) revert InvalidDTokenAmount();
         if (dToken.convertToDToken(underlyingAmount) != _dTokenAmount) revert InvalidDTokenAmount();
+        _requireConfirmedFullyBacked();
     }
 
     /// @dev Liability views round up so any unexpected or force-created dToken dust

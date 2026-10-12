@@ -41,6 +41,15 @@ abstract contract CompositePriceFeed is MainnetPriceFeedBase {
         return _fetchPriceDuringShutdown();
     }
 
+    function fetchUrgentRedemptionPrice() public virtual returns (uint256, bool) {
+        // Composite feeds without a dedicated wind-down quote use their live normal price,
+        // but must not expose the terminal source cache as an urgent settlement quote.
+        if (priceSource == PriceSource.primary) return _fetchPricePrimary(false);
+
+        assert(priceSource == PriceSource.lastGoodPrice);
+        return (lastGoodPrice, true);
+    }
+
     function _fetchPriceDuringShutdown() internal view returns (uint256, bool) {
         assert(priceSource == PriceSource.lastGoodPrice);
         return (lastGoodPrice, false);

@@ -11,6 +11,8 @@ interface IBorrowerOperations is ILiquityBase, IAddRemoveManagers {
     function MCR() external view returns (uint256);
     function SCR() external view returns (uint256);
 
+    function syncRiskParams(uint256 _ccr, uint256 _mcr, uint256 _bcr, uint256 _scr) external;
+
     function openTrove(
         address _owner,
         uint256 _ownerIndex,
@@ -88,8 +90,10 @@ interface IBorrowerOperations is ILiquityBase, IAddRemoveManagers {
     function claimCollateral() external;
 
     function hasBeenShutDown() external view returns (bool);
+    function isOracleFailureShutdown() external view returns (bool);
     function shutdown() external;
     function shutdownFromOracleFailure() external;
+    function resumeFromOracleFailure() external;
 
     function checkBatchManagerExists(address _batchMananger) external view returns (bool);
 

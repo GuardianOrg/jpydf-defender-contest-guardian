@@ -22,6 +22,15 @@ import "./IPriceFeed.sol";
 import "./IWETH.sol";
 
 interface IAddressesRegistry {
+    struct RiskParams {
+        uint256 CCR;
+        uint256 MCR;
+        uint256 BCR;
+        uint256 SCR;
+        uint256 LIQUIDATION_PENALTY_SP;
+        uint256 LIQUIDATION_PENALTY_REDISTRIBUTION;
+    }
+
     struct AddressVars {
         IERC20Metadata collToken;
         IBorrowerOperations borrowerOperations;
@@ -43,12 +52,15 @@ interface IAddressesRegistry {
         IWETH WETH;
     }
 
-    function CCR() external returns (uint256);
-    function SCR() external returns (uint256);
-    function MCR() external returns (uint256);
-    function BCR() external returns (uint256);
-    function LIQUIDATION_PENALTY_SP() external returns (uint256);
-    function LIQUIDATION_PENALTY_REDISTRIBUTION() external returns (uint256);
+    function CCR() external view returns (uint256);
+    function SCR() external view returns (uint256);
+    function MCR() external view returns (uint256);
+    function BCR() external view returns (uint256);
+    function LIQUIDATION_PENALTY_SP() external view returns (uint256);
+    function LIQUIDATION_PENALTY_REDISTRIBUTION() external view returns (uint256);
+
+    function riskParamsFinalizer() external view returns (address);
+    function riskParamsFinalized() external view returns (bool);
 
     function collToken() external view returns (IERC20Metadata);
     function borrowerOperations() external view returns (IBorrowerOperations);
@@ -70,4 +82,5 @@ interface IAddressesRegistry {
     function WETH() external returns (IWETH);
 
     function setAddresses(AddressVars memory _vars) external;
+    function finalizeRiskParams(address _expectedUnderlying, RiskParams calldata _riskParams) external;
 }

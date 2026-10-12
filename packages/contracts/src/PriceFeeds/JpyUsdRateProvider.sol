@@ -12,7 +12,8 @@ import "../Interfaces/IJpyUsdRateProvider.sol";
  *      price feed. Healthy Chainlink responses refresh one shared cache. Invalid, stale, or
  *      reverting responses reuse that cache for at most MAX_JPY_FREEZE_DURATION. Expiration
  *      remains latched while the oracle is unhealthy, but a later fresh response starts a new
- *      healthy episode. Branches that already observed expiry remain shut down at Core level.
+ *      healthy episode. Branches that already observed expiry remain in the reversible Core
+ *      oracle pause until their registered PriceFeed explicitly resumes them.
  */
 contract JpyUsdRateProvider is IJpyUsdRateProvider {
     error InsufficientGasForExternalCall();
@@ -28,7 +29,7 @@ contract JpyUsdRateProvider is IJpyUsdRateProvider {
     uint8 public immutable oracleDecimals;
 
     uint256 public lastGoodJpyRate;
-    uint256 public lastGoodJpyUpdatedAt;
+    uint256 public override lastGoodJpyUpdatedAt;
     uint256 public jpyFrozenSince;
     bool public jpyFreezeExpired;
 
@@ -94,6 +95,11 @@ contract JpyUsdRateProvider is IJpyUsdRateProvider {
         ) {
             lastGoodJpyRate = _scaleTo18Decimals(response.answer);
             lastGoodJpyUpdatedAt = response.updatedAt;
+            // A newer valid round marks a new data episode even if no caller observed it while
+            // fresh. Re-anchor the stale episode below instead of inheriting the old timer. An
+            // already-expired episode returned above and still requires an observed fresh
+            // response to clear its latch.
+            jpyFrozenSince = 0;
         }
 
         rate = lastGoodJpyRate;
@@ -117,6 +123,17 @@ contract JpyUsdRateProvider is IJpyUsdRateProvider {
 
     function _getCurrentChainlinkResponse() internal view returns (ChainlinkResponse memory response) {
         uint256 gasBefore = gasleft();
+
+        // Both fresh and stale-but-new adoption require `response.success`, so invalidate the
+        // response here before either path can scale or cache a differently-scaled answer.
+        try jpyUsdOracle.decimals() returns (uint8 liveDecimals) {
+            if (liveDecimals != oracleDecimals) return response;
+        } catch {
+            if (gasleft() <= gasBefore / 64) revert InsufficientGasForExternalCall();
+            return response;
+        }
+
+        gasBefore = gasleft();
 
         try jpyUsdOracle.latestRoundData() returns (
             uint80 roundId, int256 answer, uint256, /* startedAt */ uint256 updatedAt, uint80 answeredInRound

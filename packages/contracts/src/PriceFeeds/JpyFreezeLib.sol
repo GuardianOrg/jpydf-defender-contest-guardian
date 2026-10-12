@@ -26,7 +26,7 @@ interface IBackingRatioSource {
  *      indistinguishable from the pre-library feeds.
  *
  *      The shared `JpyUsdRateProvider` remains a separate contract: it owns the
- *      last-good JPY rate, report provenance, freeze timer, recovery, and terminal
+ *      last-good JPY rate, report provenance, freeze timer, recovery, and bounded
  *      expiry, so every branch receives the same rate and expiry decision. This
  *      library only holds the per-feed backing-ratio state and the per-feed glue.
  */
@@ -77,24 +77,15 @@ library JpyFreezeLib {
     /// @dev The provider latches shared expiry for the current unhealthy episode before this
     ///      call. Catch a source-level
     ///      BorrowerOperations authorization failure so the enclosing PriceFeedProxy call
-    ///      does not roll that provider mutation back. The source still enters its terminal
-    ///      state and returns failure=true; the registered proxy then performs shutdown.
-    ///      The calling feed flips its own `priceSource` to lastGoodPrice after this call.
-    ///      Returns whether the branch was actually shut down, so the caller can latch its
-    ///      terminal `priceSource` only when it was. Under the PriceFeedProxy topology the
-    ///      proxy is the registered price feed, so this call always reverts and the proxy
-    ///      performs the shutdown from the returned failure=true. Latching regardless would
-    ///      let any caller reach the public `fetchPrice()` directly, consume that one-shot
-    ///      signal, and leave the branch live on a frozen price: once `priceSource` is
-    ///      lastGoodPrice, later fetches take `_fetchPriceDuringShutdown`, which reports
-    ///      (lastGoodPrice, false). Where the feed itself is the registered price feed the
-    ///      call succeeds and the latch happens as before.
+    ///      does not roll that provider mutation back. The source returns failure=true and stays
+    ///      on its primary path so recovery remains observable; the registered proxy performs
+    ///      temporary shutdown and later validates the recovered source before resuming.
     function shutDownFromSharedJpyFailure(
         IBorrowerOperations _borrowerOperations,
         IJpyUsdRateProvider _jpyUsdRateProvider
-    ) internal returns (bool shutDown) {
+    ) internal returns (bool signalledDirectly) {
         try _borrowerOperations.shutdownFromOracleFailure() {
-            shutDown = true;
+            signalledDirectly = true;
         } catch {}
         emit ShutDownFromOracleFailure(address(_jpyUsdRateProvider));
     }

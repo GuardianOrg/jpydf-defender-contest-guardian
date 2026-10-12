@@ -64,8 +64,18 @@ contract SkyUsdcSUsdsYieldZapper is CollateralYieldZapper {
         IERC4626 _susdsVault,
         IERC20 _usdcToken,
         IERC20 _usdsToken,
-        ISkyUsdcSUsdsConverter _usdcUsdsConverter
-    ) CollateralYieldZapper(_addressesRegistry, _collateralVault, IERC20(address(_susdsVault)), address(0)) {
+        ISkyUsdcSUsdsConverter _usdcUsdsConverter,
+        address _lidoReferralManager
+    )
+        CollateralYieldZapper(
+            _addressesRegistry,
+            _collateralVault,
+            IERC20(address(_susdsVault)),
+            address(0),
+            address(0),
+            _lidoReferralManager
+        )
+    {
         if (
             address(_usdcToken) == address(0) || address(_usdsToken) == address(0)
                 || address(_usdcUsdsConverter) == address(0)

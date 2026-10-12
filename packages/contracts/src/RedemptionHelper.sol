@@ -46,6 +46,8 @@ contract RedemptionHelper is IRedemptionHelper {
         returns (SimulationContext[] memory branch, uint256 totalProportions)
     {
         branch = new SimulationContext[](numBranches);
+        bool[] memory redemptionPriceAvailable = new bool[](numBranches);
+        uint256 availableProportions;
 
         // First priority: proportional to unbacked debt
         for (uint256 i = 0; i < numBranches; ++i) {
@@ -53,7 +55,12 @@ contract RedemptionHelper is IRedemptionHelper {
             branch[i].sortedTroves = address(addresses[i].sortedTroves());
             (branch[i].proportion, branch[i].price, branch[i].redeemable) =
                 ITroveManager(branch[i].troveManager).getUnbackedPortionPriceAndRedeemability();
-            if (branch[i].redeemable) totalProportions += branch[i].proportion;
+            if (branch[i].redeemable) {
+                (, bool redemptionFailure) = addresses[i].priceFeed().fetchRedemptionPrice();
+                redemptionPriceAvailable[i] = !redemptionFailure;
+                totalProportions += branch[i].proportion;
+                if (!redemptionFailure) availableProportions += branch[i].proportion;
+            }
         }
 
         // CS-JPYDF-013: truncate redemption if it would exceed total unbacked debt
@@ -61,13 +68,21 @@ contract RedemptionHelper is IRedemptionHelper {
 
         // Fallback: proportional to total debt
         if (totalProportions == 0) {
+            availableProportions = 0;
             for (uint256 i = 0; i < numBranches; ++i) {
                 branch[i].proportion = ITroveManager(branch[i].troveManager).getEntireBranchDebt();
-                if (branch[i].redeemable) totalProportions += branch[i].proportion;
+                if (branch[i].redeemable) {
+                    totalProportions += branch[i].proportion;
+                    if (redemptionPriceAvailable[i]) availableProportions += branch[i].proportion;
+                }
             }
         }
 
-        if (totalProportions == 0) return (branch, totalProportions);
+        for (uint256 i = 0; i < numBranches; ++i) {
+            if (branch[i].redeemable && !redemptionPriceAvailable[i]) branch[i].redeemable = false;
+        }
+
+        if (totalProportions == 0 || availableProportions == 0) return (branch, 0);
 
         for (uint256 i = 0; i < numBranches; ++i) {
             if (!branch[i].redeemable) continue;
@@ -133,7 +148,8 @@ contract RedemptionHelper is IRedemptionHelper {
 
         for (uint256 i = 0; i < numBranches; ++i) {
             if (branch[i].redeemable && branch[i].proportion > 0) {
-                (uint256 redemptionPrice,) = addresses[i].priceFeed().fetchRedemptionPrice();
+                (uint256 redemptionPrice, bool redemptionFailure) = addresses[i].priceFeed().fetchRedemptionPrice();
+                if (redemptionFailure) return (0, 0, new Redeemed[](numBranches));
                 redeemed[i].jpydf = truncatedJpydf * branch[i].proportion / totalProportions;
                 redeemed[i].coll = redeemed[i].jpydf * (DECIMAL_PRECISION - feePct) / redemptionPrice;
             }

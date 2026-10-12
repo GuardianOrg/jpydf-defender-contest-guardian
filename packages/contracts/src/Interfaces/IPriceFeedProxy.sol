@@ -8,7 +8,7 @@ import "./IBorrowerOperations.sol";
 /**
  * @title IPriceFeedProxy
  * @notice Interface for a swappable-source price feed: a fixed reference address whose
- *         underlying price source is switchable behind a 24h timelock. This is NOT a
+ *         underlying price source is switchable behind a 12h timelock. This is NOT a
  *         UUPS / delegatecall / storage proxy and is not upgradeable in the storage sense.
  *         Extends IPriceFeed (original Liquity interface) with proxy-specific functions.
  * @dev Ownership (2-step) is provided by inheriting OpenZeppelin Ownable2Step in the
@@ -38,17 +38,21 @@ interface IPriceFeedProxy is IPriceFeed {
     event SourceProposalCancelled(address indexed cancelledSource);
     /// @notice Emitted when the proxy's own fail-safe activates: the source reverted, or
     ///         returned an invalid (0/max) or failure-flagged price, so the proxy triggered
-    ///         branch shutdown and served a fallback price. Lets monitors detect proxy-level
-    ///         oracle-failure handling, not just BorrowerOperations' shutdown event.
+    ///         temporary oracle-failure shutdown and served a fallback price. Lets monitors
+    ///         detect proxy-level oracle-failure handling, not just BorrowerOperations' event.
     event SourceFailureHandled(address indexed source);
 
     /// @notice Emitted when borrowerOperations.shutdownFromOracleFailure() reverted inside the
     ///         proxy's fail-safe path. That call reverts only on caller-mismatch (this proxy is
     ///         not the branch's registered priceFeed -- a deploy miswire), since it is a no-op
-    ///         when already shut down. The proxy intentionally does NOT propagate the revert
+    ///         when already in temporary or permanent shutdown. The proxy intentionally does NOT
+    ///         propagate the revert
     ///         (that would let one branch DoS the system-wide redemption loop); it serves
     ///         lastGoodPrice and raises this alarm so monitoring can detect a miswired branch.
     event ShutdownCallReverted(address indexed borrowerOperations, address indexed source);
+    event OracleFailureShutdownResumed(
+        address indexed source, uint256 validatedPrice, uint256 validatedRedemptionPrice
+    );
 
     // --- Errors ---
     error InvalidSource();
@@ -59,6 +63,9 @@ interface IPriceFeedProxy is IPriceFeed {
     error SourcePriceDeviationTooLarge(uint256 oldPrice, uint256 newPrice, uint256 maxDeviationBps);
     error ZeroOwnerAddress();
     error RenounceOwnershipDisabled();
+    error OracleFailureShutdownNotActive();
+    error SourceNotHealthy();
+    error UrgentRedemptionPriceUnavailable(address source);
 
     // --- Views ---
     function source() external view returns (address);
@@ -73,4 +80,5 @@ interface IPriceFeedProxy is IPriceFeed {
     function confirmSource() external;
     function confirmSourceEmergency() external;
     function cancelSourceProposal() external;
+    function resumeFromOracleFailure() external;
 }

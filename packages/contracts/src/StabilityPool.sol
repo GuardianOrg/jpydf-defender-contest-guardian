@@ -120,6 +120,7 @@ contract StabilityPool is LiquityBase, IStabilityPool, IStabilityPoolEvents {
 
     string public constant NAME = "StabilityPool";
 
+    IAddressesRegistry internal immutable addressesRegistry;
     IERC20 public immutable collToken;
     ITroveManager public immutable troveManager;
     IJpydfToken public immutable jpydfToken;
@@ -190,6 +191,7 @@ contract StabilityPool is LiquityBase, IStabilityPool, IStabilityPoolEvents {
     event JpydfTokenAddressChanged(address _newJpydfTokenAddress);
 
     constructor(IAddressesRegistry _addressesRegistry) LiquityBase(_addressesRegistry) {
+        addressesRegistry = _addressesRegistry;
         collToken = _addressesRegistry.collToken();
         troveManager = _addressesRegistry.troveManager();
         jpydfToken = _addressesRegistry.jpydfToken();
@@ -225,6 +227,7 @@ contract StabilityPool is LiquityBase, IStabilityPool, IStabilityPoolEvents {
     * - Sends depositor's accumulated Coll gains to depositor
     */
     function provideToSP(uint256 _topUp, bool _doClaim) external override {
+        if (!addressesRegistry.riskParamsFinalized()) revert RiskParamsNotFinalized();
         _requireNonZeroAmount(_topUp);
 
         activePool.mintAggInterest();

@@ -29,6 +29,8 @@ import "./IJpydfRewardsReceiver.sol";
  *
 */
 interface IStabilityPool is ILiquityBase, IJpydfRewardsReceiver {
+    error RiskParamsNotFinalized();
+
     function jpydfToken() external view returns (IJpydfToken);
     function troveManager() external view returns (ITroveManager);
 
