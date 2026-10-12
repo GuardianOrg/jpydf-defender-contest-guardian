@@ -1,0 +1,4 @@
+V2-gov/=lib/V2-gov/
+openzeppelin/=lib/V2-gov/lib/openzeppelin-contracts/
+openzeppelin-contracts/=lib/openzeppelin-contracts/
+openzeppelin-contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/

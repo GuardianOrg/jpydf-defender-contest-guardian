@@ -1,0 +1,51 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+evm_version = 'cancun'
+optimizer = true
+optimizer_runs = 200
+ignored_error_codes = [3860, 5574] # contract-size
+fs_permissions = [
+    { access = "read", path = "./utils/assets/" },
+    { access = "read-write", path = "./utils/assets/test_output" },
+    { access = "read-write", path = "./deployment-manifest.json" },
+    { access = "read-write", path = "./verification-manifests/" },
+    { access = "read-write", path = "./pilot-artifacts" },
+    { access = "read-write", path = "./canary-artifacts" },
+    { access = "read", path = "./dtoken-cap-conversion.json" },
+    { access = "read", path = "../config/day1-branch-manifest.json" },
+    { access = "read-write", path = "./pil-activation-manifest.json" }
+]
+
+[invariant]
+call_override = false
+fail_on_revert = true
+runs = 500
+depth = 50
+# failure_persist_dir = "/dev/null" # XXX circumvent this half-baked Foundry feature
+shrink_run_limit = 0 # XXX shrinking is super broken, results in completely wrong repro sequence
+
+[profile.ci]
+# Fixtures precompute CREATE addresses across setup calls; preserve their nonce semantics.
+isolate = false
+
+[profile.production-timelock]
+# Keep the separately deployed production Timelock bytecode identical across
+# operator hosts; deployment preflight pins the resulting creation/runtime hashes.
+bytecode_hash = "none"
+cbor_metadata = false
+
+[profile.ci.invariant]
+shrink_run_limit = 0 # takes too damn long to shrink, don't waste Github minutes
+
+[rpc_endpoints]
+mainnet = "${MAINNET_RPC_URL}"
+
+[profile.fork]
+broadcast = 'broadcast-fork'
+# Local fork deployments use the forked chain ID. Do not commingle ephemeral
+# fork storage with real chain storage cache entries.
+no_storage_caching = true
+
+# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

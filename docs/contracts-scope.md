@@ -1,0 +1,42 @@
+# Contracts in Scope
+
+Only the [baseline-to-final changes](review-boundaries.md) in these files, including their interactions with unchanged code, are eligible. Findings must reproduce at the final commit. Issues independent of those changes are out of scope.
+
+- `packages/contracts/src/AddressesRegistry.sol`
+- `packages/contracts/src/BorrowerOperations.sol`
+- `packages/contracts/src/CollateralVault.sol`
+- `packages/contracts/src/DFStabilityPool.sol`
+- `packages/contracts/src/DToken.sol`
+- `packages/contracts/src/Dependencies/Constants.sol`
+- `packages/contracts/src/Initiatives/UniV4MerklInitiative.sol`
+- `packages/contracts/src/Interfaces/IAddressesRegistry.sol`
+- `packages/contracts/src/Interfaces/IBorrowerOperations.sol`
+- `packages/contracts/src/Interfaces/ICollateralVault.sol`
+- `packages/contracts/src/Interfaces/IDToken.sol`
+- `packages/contracts/src/Interfaces/IJpyUsdRateProvider.sol`
+- `packages/contracts/src/Interfaces/IPriceFeed.sol`
+- `packages/contracts/src/Interfaces/IPriceFeedProxy.sol`
+- `packages/contracts/src/Interfaces/IRedemptionHelper.sol`
+- `packages/contracts/src/Interfaces/IStabilityPool.sol`
+- `packages/contracts/src/Interfaces/IStrategy.sol`
+- `packages/contracts/src/Interfaces/ITroveManager.sol`
+- `packages/contracts/src/JpydfToken.sol`
+- `packages/contracts/src/PILAllocator.sol`
+- `packages/contracts/src/PriceFeeds/CompositePriceFeed.sol`
+- `packages/contracts/src/PriceFeeds/DFPriceFeedBase.sol`
+- `packages/contracts/src/PriceFeeds/DFWstETHPriceFeed.sol`
+- `packages/contracts/src/PriceFeeds/JpyFreezeLib.sol`
+- `packages/contracts/src/PriceFeeds/JpyUsdRateProvider.sol`
+- `packages/contracts/src/PriceFeeds/MainnetPriceFeedBase.sol`
+- `packages/contracts/src/PriceFeeds/PriceFeedPlaceholder.sol`
+- `packages/contracts/src/PriceFeeds/PriceFeedProxy.sol`
+- `packages/contracts/src/RedemptionHelper.sol`
+- `packages/contracts/src/StabilityPool.sol`
+- `packages/contracts/src/Strategies/AaveV3Strategy.sol`
+- `packages/contracts/src/Strategies/BaseStrategy.sol`
+- `packages/contracts/src/Strategies/ERC4626Strategy.sol`
+- `packages/contracts/src/Strategies/MorphoV2Strategy.sol`
+- `packages/contracts/src/TroveManager.sol`
+- `packages/contracts/src/Types/RiskParams.sol`
+- `packages/contracts/src/Zappers/CollateralYieldZapper.sol`
+- `packages/contracts/src/Zappers/archive/SkyUsdcSUsdsYieldZapper.sol`

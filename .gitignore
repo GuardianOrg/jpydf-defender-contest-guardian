@@ -1,0 +1,10 @@
+**/lib
+.dependencies/
+**/node_modules/
+**/out/
+**/cache/
+**/broadcast*/
+**/__pycache__/
+.DS_Store
+.env
+.env.*
