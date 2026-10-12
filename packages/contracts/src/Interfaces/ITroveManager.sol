@@ -3,6 +3,7 @@
 pragma solidity ^0.8.0;
 
 import "./ILiquityBase.sol";
+import "../Types/RiskParams.sol";
 import "./ITroveNFT.sol";
 import "./IBorrowerOperations.sol";
 import "./IStabilityPool.sol";
@@ -22,13 +23,7 @@ interface ITroveManager is ILiquityBase {
 
     function shutdownTime() external view returns (uint256);
 
-    function syncRiskParams(
-        uint256 _ccr,
-        uint256 _mcr,
-        uint256 _scr,
-        uint256 _liquidationPenaltySP,
-        uint256 _liquidationPenaltyRedistribution
-    ) external;
+    function syncRiskParams(RiskParams calldata _riskParams) external;
 
     function troveNFT() external view returns (ITroveNFT);
     function stabilityPool() external view returns (IStabilityPool);

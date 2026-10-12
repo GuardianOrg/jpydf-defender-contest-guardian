@@ -4,6 +4,7 @@ pragma solidity ^0.8.0;
 
 import "openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 
+import "../Types/RiskParams.sol";
 import "./IActivePool.sol";
 import "./IJpydfToken.sol";
 import "./IBorrowerOperations.sol";
@@ -22,15 +23,6 @@ import "./IPriceFeed.sol";
 import "./IWETH.sol";
 
 interface IAddressesRegistry {
-    struct RiskParams {
-        uint256 CCR;
-        uint256 MCR;
-        uint256 BCR;
-        uint256 SCR;
-        uint256 LIQUIDATION_PENALTY_SP;
-        uint256 LIQUIDATION_PENALTY_REDISTRIBUTION;
-    }
-
     struct AddressVars {
         IERC20Metadata collToken;
         IBorrowerOperations borrowerOperations;

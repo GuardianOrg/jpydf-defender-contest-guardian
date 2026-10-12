@@ -457,21 +457,33 @@ contract CollateralYieldZapper is BaseZapper, ReentrancyGuard {
         (underlyingReceived, requestId) = _closeTroveToUnderlying(_troveId, _minUnderlyingReceived);
     }
 
+    /// @notice Close without redeeming collateral through the Vault, including during a Vault incident.
+    /// @dev Uses the same owner/remove-manager authorization and configured receiver as the Underlying route.
+    function closeTroveToDToken(uint256 _troveId) external nonReentrant returns (uint256 collateral) {
+        address payable receiver;
+        (receiver, collateral) = _closeTrove(_troveId);
+        collToken.safeTransfer(receiver, collateral);
+        _sendGasCompensation(receiver);
+    }
+
     function _closeTroveToUnderlying(uint256 _troveId, uint256 _minUnderlyingReceived)
         internal
         returns (uint256 underlyingReceived, uint256 requestId)
     {
+        (address payable receiver, uint256 collateral) = _closeTrove(_troveId);
+        (underlyingReceived, requestId) = _redeemDTokenToUnderlying(collateral, receiver, _minUnderlyingReceived);
+        _sendGasCompensation(receiver);
+    }
+
+    function _closeTrove(uint256 _troveId) internal returns (address payable receiver, uint256 collateral) {
         address owner = troveNFT.ownerOf(_troveId);
-        address payable receiver = payable(_requireSenderIsOwnerOrRemoveManagerAndGetReceiver(_troveId, owner));
+        receiver = payable(_requireSenderIsOwnerOrRemoveManagerAndGetReceiver(_troveId, owner));
         _requireZapperIsReceiver(_troveId);
 
         LatestTroveData memory trove = troveManager.getLatestTroveData(_troveId);
+        collateral = trove.entireColl;
         IERC20(address(jpydfToken)).safeTransferFrom(msg.sender, address(this), trove.entireDebt);
-
         borrowerOperations.closeTrove(_troveId);
-
-        (underlyingReceived, requestId) = _redeemDTokenToUnderlying(trove.entireColl, receiver, _minUnderlyingReceived);
-        _sendGasCompensation(receiver);
     }
 
     /*//////////////////////////////////////////////////////////////

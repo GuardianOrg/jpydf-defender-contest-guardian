@@ -5,8 +5,10 @@ pragma solidity 0.8.24;
 import "./Dependencies/Ownable.sol";
 import {
     MIN_LIQUIDATION_PENALTY_SP,
+    COLL_GAS_COMPENSATION_DIVISOR,
     MAX_LIQUIDATION_PENALTY_REDISTRIBUTION,
-    URGENT_REDEMPTION_BONUS
+    URGENT_REDEMPTION_BONUS,
+    COLL_GAS_COMPENSATION_CAP
 } from "./Dependencies/Constants.sol";
 import "./Interfaces/IAddressesRegistry.sol";
 import "./Interfaces/IMetadataNFT.sol";
@@ -53,6 +55,7 @@ contract AddressesRegistry is Ownable, IAddressesRegistry {
     address public immutable riskParamsFinalizer;
     bool public riskParamsFinalized;
 
+    error InvalidCollGasCompensationCap();
     error InvalidCCR();
     error InvalidMCR();
     error InvalidBCR();
@@ -62,6 +65,7 @@ contract AddressesRegistry is Ownable, IAddressesRegistry {
     error RedistPenaltyTooHigh();
     error InvalidCollateralRatioOrder();
     error MCRBelowSPPenalty();
+    error MCRBelowRedistributionPenalty();
     error SCRBelowUrgentRedemptionBonus();
     error CallerNotRiskParamsFinalizer();
     error RiskParamsAlreadyFinalized();
@@ -105,7 +109,8 @@ contract AddressesRegistry is Ownable, IAddressesRegistry {
         uint256 BCR,
         uint256 SCR,
         uint256 liquidationPenaltySP,
-        uint256 liquidationPenaltyRedistribution
+        uint256 liquidationPenaltyRedistribution,
+        uint256 collGasCompensationCap
     );
 
     constructor(
@@ -184,6 +189,12 @@ contract AddressesRegistry is Ownable, IAddressesRegistry {
             _riskParams.LIQUIDATION_PENALTY_SP,
             _riskParams.LIQUIDATION_PENALTY_REDISTRIBUTION
         );
+        if (
+            _riskParams.COLL_GAS_COMPENSATION_CAP == 0
+                || _riskParams.COLL_GAS_COMPENSATION_CAP > COLL_GAS_COMPENSATION_CAP
+        ) {
+            revert InvalidCollGasCompensationCap();
+        }
         _requireBranchReadyForFinalization(_expectedUnderlying);
 
         CCR = _riskParams.CCR;
@@ -195,13 +206,7 @@ contract AddressesRegistry is Ownable, IAddressesRegistry {
         riskParamsFinalized = true;
 
         borrowerOperations.syncRiskParams(_riskParams.CCR, _riskParams.MCR, _riskParams.BCR, _riskParams.SCR);
-        troveManager.syncRiskParams(
-            _riskParams.CCR,
-            _riskParams.MCR,
-            _riskParams.SCR,
-            _riskParams.LIQUIDATION_PENALTY_SP,
-            _riskParams.LIQUIDATION_PENALTY_REDISTRIBUTION
-        );
+        troveManager.syncRiskParams(_riskParams);
 
         emit RiskParamsFinalized(
             _expectedUnderlying,
@@ -210,7 +215,8 @@ contract AddressesRegistry is Ownable, IAddressesRegistry {
             _riskParams.BCR,
             _riskParams.SCR,
             _riskParams.LIQUIDATION_PENALTY_SP,
-            _riskParams.LIQUIDATION_PENALTY_REDISTRIBUTION
+            _riskParams.LIQUIDATION_PENALTY_REDISTRIBUTION,
+            _riskParams.COLL_GAS_COMPENSATION_CAP
         );
     }
 
@@ -241,7 +247,11 @@ contract AddressesRegistry is Ownable, IAddressesRegistry {
     ) internal pure {
         _requireValidRiskParams(_ccr, _mcr, _bcr, _scr, _liquidationPenaltySP, _liquidationPenaltyRedistribution);
         if (_scr >= _mcr || _mcr >= _ccr) revert InvalidCollateralRatioOrder();
-        if (1e18 + _liquidationPenaltySP > _mcr) revert MCRBelowSPPenalty();
+        if (
+            _mcr * (COLL_GAS_COMPENSATION_DIVISOR - 1)
+                < (1e18 + _liquidationPenaltySP) * COLL_GAS_COMPENSATION_DIVISOR
+        ) revert MCRBelowSPPenalty();
+        if (1e18 + _liquidationPenaltyRedistribution > _mcr) revert MCRBelowRedistributionPenalty();
         if (1e18 + URGENT_REDEMPTION_BONUS > _scr) revert SCRBelowUrgentRedemptionBonus();
     }
 

@@ -22,9 +22,10 @@ interface IRedemptionHelper {
         external
         returns (SimulationContext[] memory branch, uint256 totalProportions);
 
-    // Find the maximal amount of JPYDF that can be redeemed proportionally within
-    // a given iteration limit. This helps prevent the redeemer from overpaying on
-    // the redemption fee.
+    // Find the request amount associated with the proportional quote within the
+    // iteration limit. This is not a full-fill guarantee: unavailable branches
+    // retain their allocation weights, so part of truncatedJpydf may remain unspent.
+    // Sum redeemed[i].jpydf for the expected fill. This helps avoid overpaying fees.
     //
     // Also returns the expected fee that will be paid (as a percentage), and the
     // expected collateral amounts that will be paid out in exchange for the

@@ -129,7 +129,13 @@ library JpyFreezeLib {
 
             self.lastGoodBacking = liveBacking;
             return (Math.mulDiv(_jpyPrice, liveBacking, 1e18), false);
-        } catch {
+        } catch (bytes memory err) {
+            // The Vault reverts with the same gas-guard error when the caller cannot fund the
+            // fixed Strategy probe budget (Guardian Remediation L-01). Bubble it unchanged so a
+            // gas-starved call is never classified as an oracle failure.
+            if (err.length == 4 && bytes4(err) == InsufficientGasForExternalCall.selector) {
+                revert InsufficientGasForExternalCall();
+            }
             if (gasleft() <= gasBefore / 64) revert InsufficientGasForExternalCall();
             return (0, true);
         }

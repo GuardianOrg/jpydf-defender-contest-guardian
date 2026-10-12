@@ -28,11 +28,11 @@ interface IMerklDistributor {
  *   - `deposit(declared, received)`: onlyVault. Underlying is transferred BEFORE this call.
  *                                  Runs `_doDeposit(received)` in an isolated self-call; on
  *                                  rejection, returns the exact receipt to the Vault or reverts.
- *   - `sendToVault(amount)`     : ALLOCATOR_ROLE on Vault.
+ *   - `sendToVault(amount)`     : WITHDRAWER_ROLE on Vault.
  *                                  Withdraws from the upstream protocol via `_doWithdraw`,
  *                                  reduces `principal` (principal-first), pushes the result
  *                                  to the Vault via `receiveFromStrategy`.
- *   - `sendProfitToVault()`     : ALLOCATOR_ROLE on Vault.
+ *   - `sendProfitToVault()`     : HARVESTER_ROLE on Vault.
  *                                  Caps the amount at `realizedYield()`, withdraws via
  *                                  `_doWithdraw`, leaves `principal` unchanged, pushes
  *                                  the result directly to the Vault buffer.
@@ -78,8 +78,11 @@ abstract contract BaseStrategy is Initializable, IStrategy, OwnableUpgradeable, 
     //                          CONSTANTS
     // =============================================================
 
-    /// @dev Must match `CollateralVault.ALLOCATOR_ROLE`.
+    /// @dev Legacy role retained only for archived async strategy request functions.
     bytes32 internal constant _ALLOCATOR_ROLE = keccak256("ALLOCATOR_ROLE");
+    /// @dev Must match the operation-specific roles on CollateralVault.
+    bytes32 internal constant _WITHDRAWER_ROLE = keccak256("WITHDRAWER_ROLE");
+    bytes32 internal constant _HARVESTER_ROLE = keccak256("HARVESTER_ROLE");
     uint256 public constant MAX_MERKL_TOKENS_PER_CLAIM = 16;
 
     // =============================================================
@@ -329,7 +332,7 @@ abstract contract BaseStrategy is Initializable, IStrategy, OwnableUpgradeable, 
         external
         override
         nonReentrantStrategy
-        onlyVaultRole(_ALLOCATOR_ROLE)
+        onlyVaultRole(_WITHDRAWER_ROLE)
         returns (uint256 sent)
     {
         if (_amount == 0) return 0;
@@ -361,7 +364,7 @@ abstract contract BaseStrategy is Initializable, IStrategy, OwnableUpgradeable, 
         external
         override
         nonReentrantStrategy
-        onlyVaultRole(_ALLOCATOR_ROLE)
+        onlyVaultRole(_HARVESTER_ROLE)
         returns (uint256 sent)
     {
         uint256 realizedProfit = realizedYield();
@@ -376,10 +379,18 @@ abstract contract BaseStrategy is Initializable, IStrategy, OwnableUpgradeable, 
             return 0;
         }
 
-        // Yield-only push: `_principal` is intentionally left unchanged. Send
+        // A converter's loss allowance can withdraw more than the measured yield.
+        // Return that excess as principal instead of leaving phantom principal behind.
+        if (withdrawnUnderlying > realizedProfit) {
+            uint256 returned = ICollateralVault(vault).receiveFromStrategy(withdrawnUnderlying - realizedProfit);
+            _accountReturnedPrincipal(returned);
+            withdrawnUnderlying = realizedProfit;
+        }
+
+        // The remaining yield-only push leaves `_principal` unchanged. Send
         // directly to the Vault buffer so Strategy valuation cache is not
         // reduced as if principal had been returned.
-        sent = _sendUnderlyingYieldToVault(withdrawnUnderlying);
+        sent = _sendUnderlyingToVault(withdrawnUnderlying);
         emit ProfitSentToVault(msg.sender, realizedProfit, sent);
     }
 
@@ -531,7 +542,7 @@ abstract contract BaseStrategy is Initializable, IStrategy, OwnableUpgradeable, 
             uint256 claimedUnderlying =
                 balanceAfterClaim > _balanceBeforeClaim ? balanceAfterClaim - _balanceBeforeClaim : 0;
             if (claimedUnderlying != 0) {
-                settled = _sendUnderlyingYieldToVault(claimedUnderlying);
+                settled = _sendUnderlyingToVault(claimedUnderlying);
             }
             emit MerklUnderlyingRewardsClaimed(_distributor, _token, _cumulativeAmount, settled);
         } else {
@@ -540,7 +551,7 @@ abstract contract BaseStrategy is Initializable, IStrategy, OwnableUpgradeable, 
         }
     }
 
-    function _sendUnderlyingYieldToVault(uint256 _amount) internal returns (uint256 sent) {
+    function _sendUnderlyingToVault(uint256 _amount) internal returns (uint256 sent) {
         if (_amount == 0) return 0;
 
         uint256 vaultBalanceBefore = underlyingToken.balanceOf(vault);

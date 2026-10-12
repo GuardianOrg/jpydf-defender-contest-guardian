@@ -8,6 +8,7 @@ import {ReentrancyGuard} from "openzeppelin-contracts/contracts/security/Reentra
 
 import {IDistributionCreator} from "src/Interfaces/IDistributionCreator.sol";
 import {IInitiative} from "src/Interfaces/IInitiative.sol";
+import {PILAllocator} from "src/PILAllocator.sol";
 
 /**
  * @title UniV4MerklInitiative
@@ -36,6 +37,7 @@ contract UniV4MerklInitiative is IInitiative, ReentrancyGuard {
     mapping(uint256 => bytes32) public campaignIdByStartTimestamp;
 
     event NewMerklCampaign(uint256 indexed epoch, uint256 amount, bytes32 campaignId);
+    event FundsReturnedToAllocator(uint256 amount);
     event MerklCampaignAlreadyCreated(
         uint256 indexed epoch, uint256 indexed startTimestamp, uint256 amount, bytes32 campaignId
     );
@@ -51,6 +53,10 @@ contract UniV4MerklInitiative is IInitiative, ReentrancyGuard {
     error UniV4MerklInitiative__CampaignCreationTooEarly(uint256 earliestPublicCreation);
     error UniV4MerklInitiative__TimestampTooLarge(uint256 timestamp);
     error UniV4MerklInitiative__DependencyNotContract(address dependency);
+    error UniV4MerklInitiative__Unauthorized();
+    error UniV4MerklInitiative__Inactive();
+    error UniV4MerklInitiative__StillRegistered();
+    error UniV4MerklInitiative__AllocatorTokenMismatch();
 
     constructor(
         address _allocator,
@@ -70,8 +76,12 @@ contract UniV4MerklInitiative is IInitiative, ReentrancyGuard {
         if (address(_jpydfToken) == address(0)) revert UniV4MerklInitiative__ZeroAddress();
         if (address(_merklDistributionCreator) == address(0)) revert UniV4MerklInitiative__ZeroAddress();
         if (_campaignCreator == address(0)) revert UniV4MerklInitiative__ZeroAddress();
+        _requireContractDependency(_allocator);
         _requireContractDependency(address(_jpydfToken));
         _requireContractDependency(address(_merklDistributionCreator));
+        if (address(PILAllocator(_allocator).jpydfToken()) != address(_jpydfToken)) {
+            revert UniV4MerklInitiative__AllocatorTokenMismatch();
+        }
         _requireEpochConfig(_epochStart, _epochDuration);
         _requireCampaignConfig(_campaignJpydfAmountThreshold, _campaignCreationWindow, _epochDuration, _uniV4PoolId);
         _requireWeights(_weightFees, _weightToken0, _weightToken1);
@@ -97,7 +107,12 @@ contract UniV4MerklInitiative is IInitiative, ReentrancyGuard {
     //////////////////////////////////////////////////////////////*/
 
     function createCampaign() external nonReentrant returns (bytes32 campaignId) {
-        uint256 amount = jpydfToken.balanceOf(address(this));
+        PILAllocator funding = PILAllocator(allocator);
+        if (!funding.registeredInitiatives(address(this)) || funding.paused()) {
+            revert UniV4MerklInitiative__Inactive();
+        }
+        uint256 pending = funding.pendingFunding(address(this));
+        uint256 amount = jpydfToken.balanceOf(address(this)) + pending;
         if (amount < CAMPAIGN_JPYDF_AMOUNT_THRESHOLD) return bytes32(0);
 
         uint256 currentEpoch = epoch();
@@ -111,6 +126,8 @@ contract UniV4MerklInitiative is IInitiative, ReentrancyGuard {
         }
         _requireCampaignCreationAllowed(campaignStart);
 
+        // A Merkl revert rolls back both this withdrawal and the allocator's accounting.
+        if (pending != 0) funding.claimDeferredFunding();
         jpydfToken.forceApprove(address(merklDistributionCreator), amount);
         campaignId = merklDistributionCreator.createCampaign(
             IDistributionCreator.CampaignParameters({
@@ -131,7 +148,20 @@ contract UniV4MerklInitiative is IInitiative, ReentrancyGuard {
         emit NewMerklCampaign(currentEpoch, amount, campaignId);
     }
 
-    function onRegisterInitiative(uint256) external override {}
+    function onRegisterInitiative(uint256) external override {
+        if (msg.sender != allocator) revert UniV4MerklInitiative__Unauthorized();
+        PILAllocator(allocator).enableDeferredFunding();
+    }
+
+    /// @notice Return direct transfers after retirement, always to the fixed allocator.
+    function returnFundsToAllocator() external nonReentrant {
+        if (PILAllocator(allocator).registeredInitiatives(address(this))) {
+            revert UniV4MerklInitiative__StillRegistered();
+        }
+        uint256 amount = jpydfToken.balanceOf(address(this));
+        jpydfToken.safeTransfer(allocator, amount);
+        emit FundsReturnedToAllocator(amount);
+    }
 
     function onUnregisterInitiative(uint256) external override {}
 
@@ -166,7 +196,14 @@ contract UniV4MerklInitiative is IInitiative, ReentrancyGuard {
     }
 
     function canCreateCampaign(address caller) public view returns (bool) {
-        if (jpydfToken.balanceOf(address(this)) < CAMPAIGN_JPYDF_AMOUNT_THRESHOLD) return false;
+        PILAllocator funding = PILAllocator(allocator);
+        if (!funding.registeredInitiatives(address(this)) || funding.paused()) return false;
+        if (
+            jpydfToken.balanceOf(address(this)) + funding.pendingFunding(address(this))
+                < CAMPAIGN_JPYDF_AMOUNT_THRESHOLD
+        ) {
+            return false;
+        }
         uint256 campaignStart = nextCampaignStart();
         if (campaignIdByStartTimestamp[campaignStart] != bytes32(0)) return false;
         if (caller == CAMPAIGN_CREATOR) return true;
@@ -206,7 +243,9 @@ contract UniV4MerklInitiative is IInitiative, ReentrancyGuard {
         uint256 epochDuration_,
         bytes32 uniV4PoolId_
     ) internal pure {
-        if (campaignJpydfAmountThreshold_ == 0) revert UniV4MerklInitiative__ZeroCampaignThreshold();
+        if (campaignJpydfAmountThreshold_ == 0) {
+            revert UniV4MerklInitiative__ZeroCampaignThreshold();
+        }
         if (campaignCreationWindow_ == 0 || campaignCreationWindow_ >= epochDuration_) {
             revert UniV4MerklInitiative__InvalidCampaignCreationWindow();
         }

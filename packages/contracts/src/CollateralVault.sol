@@ -19,7 +19,7 @@ import "./Interfaces/ICollateralVault.sol";
 interface IMorphoV2IncidentStrategy {
     function forceDeallocate(address _adapter, bytes calldata _data, uint256 _assets)
         external
-        returns (uint256 penaltyShares, uint256 penaltyAssets, uint256 valuationLossAssets);
+        returns (uint256 penaltyShares, uint256 penaltyAssets, uint256 valuationLossAssets, uint256 withdrawnAssets);
 }
 
 /**
@@ -70,12 +70,24 @@ contract CollateralVault is
     // =============================================================
 
     bytes32 internal constant GOV_ROLE = keccak256("GOV_ROLE");
+    // ALLOCATOR is deliberately restricted to allocate; no legacy umbrella role.
     bytes32 internal constant ALLOCATOR_ROLE = keccak256("ALLOCATOR_ROLE");
+    bytes32 internal constant WITHDRAWER_ROLE = keccak256("WITHDRAWER_ROLE");
+    bytes32 internal constant HARVESTER_ROLE = keccak256("HARVESTER_ROLE");
+    bytes32 internal constant TREASURY_TRANSFER_ROLE = keccak256("TREASURY_TRANSFER_ROLE");
     bytes32 internal constant GUARDIAN_ROLE = keccak256("GUARDIAN_ROLE");
     bytes32 internal constant WRITEOFF_ROLE = keccak256("WRITEOFF_ROLE");
 
     uint256 internal constant BPS_DENOMINATOR = 10000;
     uint256 internal constant DEFAULT_STRATEGY_VALUATION_MAX_AGE = 1 days;
+    /// @dev Default gas budget handed to each Strategy valuation probe. A registered Strategy must
+    ///      value itself within the active budget; a probe that exceeds it is a genuine valuation
+    ///      failure. GOV can retune the budget within the bounds below.
+    uint256 internal constant DEFAULT_STRATEGY_VALUATION_GAS = 500_000;
+    uint256 internal constant MIN_STRATEGY_VALUATION_GAS = 100_000;
+    uint256 internal constant MAX_STRATEGY_VALUATION_GAS = 2_000_000;
+    /// @dev Headroom the Vault keeps for the probe call frames and the catch paths.
+    uint256 internal constant STRATEGY_VALUATION_GAS_MARGIN = 20_000;
     uint256 public constant MAX_STRATEGIES = 32;
 
     // =============================================================
@@ -113,9 +125,12 @@ contract CollateralVault is
     uint256 private _backstopReserve;
     mapping(IStrategy => StrategyValuationCache) public override strategyValuationCaches; // [3b]
     uint256 public override strategyValuationMaxAge; // [3b]
+    /// @dev Zero means DEFAULT_STRATEGY_VALUATION_GAS, so an upgraded proxy whose slot is still
+    ///      unset keeps the default budget instead of probing with no gas.
+    uint256 private _strategyValuationGasBudget; // [3b]
 
     /// @dev Storage gap for future upgrades. See OpenZeppelin's storage gap guidance.
-    uint256[47] private __gap;
+    uint256[46] private __gap;
 
     // =============================================================
     //                          ERRORS
@@ -124,6 +139,10 @@ contract CollateralVault is
     error Paused();
     error ZeroAddress();
     error ZeroAmount();
+    /// @dev Caller cannot fund the fixed Strategy valuation probe budget. Same signature as the
+    ///      price-feed gas guard so JpyFreezeLib and PriceFeedProxy bubble it instead of shutting down.
+    error InsufficientGasForExternalCall();
+    error InvalidStrategyValuationGasBudget(uint256 budget);
     error InvalidBufferConfig();
     error RequestNotReady();
     error RequestNotFound();
@@ -155,6 +174,7 @@ contract CollateralVault is
     error StrategyWriteoffNotReady();
     error InvalidBackingRatioGuard();
     error BackingRatioBelowMinimum(uint256 actual, uint256 minimum);
+    error RecoveryBelowMinimum(uint256 actual, uint256 minimum);
 
     // =============================================================
     //                        CONSTRUCTOR
@@ -197,12 +217,16 @@ contract CollateralVault is
         bufferTargetBps = 2000; // 20%
         allocateMaxMove = type(uint256).max;
         strategyValuationMaxAge = DEFAULT_STRATEGY_VALUATION_MAX_AGE;
+        _strategyValuationGasBudget = DEFAULT_STRATEGY_VALUATION_GAS;
         withdrawDelay = 1 days;
         nextRequestId = 1;
 
         _grantRole(DEFAULT_ADMIN_ROLE, _admin);
         _grantRole(GOV_ROLE, _admin);
         _grantRole(ALLOCATOR_ROLE, _admin);
+        _grantRole(WITHDRAWER_ROLE, _admin);
+        _grantRole(HARVESTER_ROLE, _admin);
+        _grantRole(TREASURY_TRANSFER_ROLE, _admin);
         _grantRole(GUARDIAN_ROLE, _admin);
         _grantRole(WRITEOFF_ROLE, _admin);
     }
@@ -472,7 +496,7 @@ contract CollateralVault is
     function transferYieldToTreasury()
         external
         override
-        onlyRole(ALLOCATOR_ROLE)
+        onlyRole(TREASURY_TRANSFER_ROLE)
         whenNotPausedAllocation
         nonReentrant
         returns (uint256 transferred)
@@ -641,11 +665,7 @@ contract CollateralVault is
     }
 
     /// @inheritdoc ICollateralVault
-    /// @dev Requires `Strategy.principal() == 0`. Drain via `Strategy.sendToVault`
-    ///      (ALLOCATOR) first, or `writeoffStrategyPrincipal` for a permanent
-    ///      loss. Works on enabled and disabled-but-still-registered Strategies
-    ///      alike; disabled Strategies always carry `weightBps == 0` (enforced by
-    ///      `updateStrategy`), so `totalWeightBps -= config.weightBps` is a no-op then.
+    /// @dev Outstanding principal and assets do not prevent emergency disabling.
     function emergencyDisableStrategy(IStrategy _strategy) external override onlyRole(GUARDIAN_ROLE) {
         if (!_isRegisteredStrategy(_strategy)) revert StrategyNotFound();
 
@@ -654,6 +674,11 @@ contract CollateralVault is
         _pauseAllocationIfNeeded();
     }
 
+    /// @inheritdoc ICollateralVault
+    /// @dev Both principal and live estimated assets must be readable and zero.
+    ///      Recover assets first; a principal writeoff alone does not prove that
+    ///      the Strategy has no residual assets. Enabled or disabled Strategies
+    ///      may be removed once both conditions hold.
     function removeStrategy(IStrategy _strategy) external override onlyRole(GUARDIAN_ROLE) nonReentrant {
         (uint256 strategyIndex, bool registered) = _strategyIndex(_strategy);
         if (!registered) revert StrategyNotFound();
@@ -710,6 +735,7 @@ contract CollateralVault is
         address _adapter,
         bytes calldata _data,
         uint256 _assets,
+        uint256 _minReceived,
         uint256 _minBackingRatioAfter
     )
         external
@@ -718,7 +744,7 @@ contract CollateralVault is
         nonReentrant
         returns (uint256 penaltyShares, uint256 penaltyAssets, uint256 valuationLossAssets)
     {
-        if (_assets == 0) revert ZeroAmount();
+        if (_assets == 0 || _minReceived == 0) revert ZeroAmount();
         if (_minBackingRatioAfter > 1e18) revert InvalidBackingRatioGuard();
         if (!_isRegisteredStrategy(_strategy)) revert StrategyNotFound();
 
@@ -728,11 +754,20 @@ contract CollateralVault is
         _pauseAllocationIfNeeded();
         _pauseUserFlows();
 
-        (penaltyShares, penaltyAssets, valuationLossAssets) =
+        uint256 balanceBefore = underlying.balanceOf(address(this));
+        uint256 withdrawnAssets;
+        (penaltyShares, penaltyAssets, valuationLossAssets, withdrawnAssets) =
             IMorphoV2IncidentStrategy(address(_strategy)).forceDeallocate(_adapter, _data, _assets);
+        uint256 received = underlying.balanceOf(address(this)) - balanceBefore;
+        if (received < _minReceived) revert RecoveryBelowMinimum(received, _minReceived);
         if (!_refreshStrategyValuation(_strategy)) {
-            _reduceStrategyValuationCache(_strategy, valuationLossAssets);
+            if (received == withdrawnAssets) {
+                _reduceStrategyValuationCache(_strategy, valuationLossAssets + withdrawnAssets);
+            } else {
+                _invalidateStrategyValuationCache(_strategy);
+            }
         }
+        emit ReceivedFromStrategy(address(_strategy), withdrawnAssets, received);
 
         uint256 backingAfter = _backingRatio();
         if (backingAfter < _minBackingRatioAfter) {
@@ -758,6 +793,22 @@ contract CollateralVault is
         uint256 oldMaxAge = strategyValuationMaxAge;
         strategyValuationMaxAge = _maxAge;
         emit StrategyValuationMaxAgeUpdated(oldMaxAge, _maxAge);
+    }
+
+    /// @inheritdoc ICollateralVault
+    function setStrategyValuationGasBudget(uint256 _budget) external override onlyRole(GOV_ROLE) {
+        if (_budget < MIN_STRATEGY_VALUATION_GAS || _budget > MAX_STRATEGY_VALUATION_GAS) {
+            revert InvalidStrategyValuationGasBudget(_budget);
+        }
+        uint256 oldBudget = strategyValuationGasBudget();
+        _strategyValuationGasBudget = _budget;
+        emit StrategyValuationGasBudgetUpdated(oldBudget, _budget);
+    }
+
+    /// @inheritdoc ICollateralVault
+    function strategyValuationGasBudget() public view override returns (uint256 budget) {
+        budget = _strategyValuationGasBudget;
+        if (budget == 0) budget = DEFAULT_STRATEGY_VALUATION_GAS;
     }
 
     function refreshStrategyValuation(IStrategy _strategy) external override returns (bool refreshed) {
@@ -854,9 +905,12 @@ contract CollateralVault is
 
         uint256 totalAssets;
         (totalAssets, available) = _totalUnderlyingWithAvailability();
+        // Unknown Strategy assets are unnecessary when the known lower bound
+        // already covers every dToken and queued-claim liability.
+        if (totalAssets >= liabilities) return (1e18, true);
         if (!available) return (0, false);
 
-        ratio = totalAssets >= liabilities ? 1e18 : Math.mulDiv(totalAssets, 1e18, liabilities);
+        ratio = Math.mulDiv(totalAssets, 1e18, liabilities);
     }
 
     function _backingRatio() internal view returns (uint256) {
@@ -1104,9 +1158,15 @@ contract CollateralVault is
 
         StrategyValuationCache storage cache = strategyValuationCaches[_strategy];
         uint256 oldValue = cache.conservativeValue;
-        if (!cache.initialized || oldValue == 0) return;
+        if (!cache.initialized) return;
+        // Exhausting a historical estimate does not prove the residual position
+        // is worth zero. Only a live valuation may establish an available zero.
+        if (_amount >= oldValue) {
+            _invalidateStrategyValuationCache(_strategy);
+            return;
+        }
 
-        uint256 newValue = _amount >= oldValue ? 0 : oldValue - _amount;
+        uint256 newValue = oldValue - _amount;
         cache.conservativeValue = newValue;
         emit StrategyValuationCacheReduced(address(_strategy), oldValue, newValue, _amount);
     }
@@ -1168,7 +1228,13 @@ contract CollateralVault is
         view
         returns (uint256 estimated, bool available)
     {
-        try _strategy.estimatedTotalUnderlying() returns (uint256 value) {
+        // Check each probe at its call boundary: the previous probe may have spent its budget.
+        // Bubble caller underfunding instead of treating a clipped stipend as valuation failure.
+        uint256 budget = strategyValuationGasBudget();
+        if (gasleft() < budget * 64 / 63 + STRATEGY_VALUATION_GAS_MARGIN) {
+            revert InsufficientGasForExternalCall();
+        }
+        try _strategy.estimatedTotalUnderlying{gas: budget}() returns (uint256 value) {
             return (value, true);
         } catch {
             return (0, false);
@@ -1176,7 +1242,11 @@ contract CollateralVault is
     }
 
     function _tryPrincipal(IStrategy _strategy) internal view returns (uint256 principal_, bool available) {
-        try _strategy.principal() returns (uint256 value) {
+        uint256 budget = strategyValuationGasBudget();
+        if (gasleft() < budget * 64 / 63 + STRATEGY_VALUATION_GAS_MARGIN) {
+            revert InsufficientGasForExternalCall();
+        }
+        try _strategy.principal{gas: budget}() returns (uint256 value) {
             return (value, true);
         } catch {
             return (0, false);

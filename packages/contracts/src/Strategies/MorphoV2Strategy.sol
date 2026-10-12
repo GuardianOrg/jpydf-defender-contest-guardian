@@ -53,8 +53,8 @@ interface IMorphoVaultV2 is IERC4626 {
  *                                  (atomic pauses/backing floor; penalty paid
  *                                  in this Strategy's shares and bounded by the
  *                                  init-frozen `maxForceDeallocatePenaltyBps`),
- *                                  then owner
- *                                  `emergencyWithdrawFromMorphoV2`.
+ *                                  with withdrawal to the Vault in the same
+ *                                  transaction and a minimum actual receipt.
  *
  *         Venue freeze policy: deploy only against Morpho V2 vaults whose
  *         receive-/send-share gates are unset. A gate installed later surfaces
@@ -284,10 +284,10 @@ contract MorphoV2Strategy is BaseStrategy {
      *      matching `emergencyWithdrawFromERC4626`, since this is their only
      *      recovery path (`sweepRewardToken` rejects the position token). The
      *      venue redeem simply reverts if liquidity is short — size `_maxShares`
-     *      to the vault's idle/deallocatable portion (use `forceDeallocate`
-     *      first when the liquidity adapter cannot pay). The Vault receipt is
+     *      to the vault's idle/deallocatable portion. When deallocation is
+     *      required, use the Vault's atomic force-deallocation recovery. Receipt is
      *      accounted as returned principal. If recovered plus still-valued
-     *      assets are short of principal, GOV should follow up with
+     *      assets are short of principal, a Vault WRITEOFF_ROLE holder must call
      *      `Vault.writeoffStrategyPrincipal(...)`.
      * @param _maxShares Upper bound on shares to redeem (pass
      *        `type(uint256).max` for a full drain attempt).
@@ -344,15 +344,15 @@ contract MorphoV2Strategy is BaseStrategy {
      *      `maxForceDeallocatePenaltyBps` bound (plus 1 wei of round-trip
      *      rounding). Donated (untracked) shares absorb the burn first; only
      *      the burn that reduces `_ownShares` is a confirmed valuation loss.
-     *      There is no haircut machinery. Follow up with
-     *      `emergencyWithdrawFromMorphoV2` (or `sendToVault`) to pull the freed
-     *      liquidity.
+     *      Immediately withdraws up to `_assets` of tracked value and transfers
+     *      it to the Vault without a callback into its locked incident entry.
+     *      The Vault enforces a nonzero minimum actual receipt atomically.
      */
     function forceDeallocate(address _adapter, bytes calldata _data, uint256 _assets)
         external
         onlyVault
         nonReentrantStrategy
-        returns (uint256 penaltyShares, uint256 penaltyAssets, uint256 valuationLossAssets)
+        returns (uint256 penaltyShares, uint256 penaltyAssets, uint256 valuationLossAssets, uint256 withdrawnAssets)
     {
         uint256 shareBalanceBefore = morphoVault.balanceOf(address(this));
         morphoVault.forceDeallocate(_adapter, _data, _assets, address(this));
@@ -378,5 +378,7 @@ contract MorphoV2Strategy is BaseStrategy {
         valuationLossAssets = ownSharesCharged == 0 ? 0 : morphoVault.convertToAssets(ownSharesCharged);
         emit OwnSharesUpdated(_ownShares);
         emit ForceDeallocated(_adapter, _assets, penaltyShares, penaltyAssets);
+        withdrawnAssets = _doWithdraw(_assets);
+        _accountReturnedPrincipal(_sendUnderlyingToVault(withdrawnAssets));
     }
 }

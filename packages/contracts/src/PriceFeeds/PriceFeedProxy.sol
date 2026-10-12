@@ -210,8 +210,15 @@ contract PriceFeedProxy is IPriceFeedProxy, Ownable2Step {
             // A source-signalled failure follows the same temporary shutdown path as a revert.
             if (_isInvalidPrice(price) || oracleFailure) return _handleFailedFetch(false);
             _lastGoodPrice = price;
+            // BorrowerOperations also requests the quote for irreversible SCR
+            // shutdown decisions. Both it and risk-increasing operations must
+            // use JPY provenance younger than 30h. Liquidations keep the source's
+            // bounded cached-rate grace; pure repayment/addition needs no quote.
+            if (msg.sender == address(borrowerOperations) && _normalRedemptionJpyStatus(source) != JPY_PROVENANCE_FRESH) {
+                return (price, true);
+            }
             // A recovered live normal price may be used before owner resume for liquidation,
-            // the TCR<SCR check, and risk-reducing borrower adjustments. Risk increases and
+            // the TCR<SCR check and CCR-checked close. Risk increases and
             // normal redemption remain gated by the latched shutdown flag.
             return (price, false);
         } catch (bytes memory err) {
@@ -226,10 +233,11 @@ contract PriceFeedProxy is IPriceFeedProxy, Ownable2Step {
             // F-02: see fetchPrice(). Route a failure-flagged-but-valid price through shutdown too.
             if (_isInvalidPrice(price) || oracleFailure) return _handleFailedFetch(true);
 
-            // Stop only normal redemption once the shared JPY/USD round reaches 30h old.
+            // Stop normal redemption once the shared JPY/USD round reaches 30h old.
             // The source call comes first so the first fresh round refreshes provenance and
             // reopens redemption automatically. This local gate deliberately does not invoke
-            // _handleFailedFetch: borrowing, liquidation and urgent redemption remain unchanged.
+            // _handleFailedFetch: the borrowing gate above is independent of the
+            // liquidation and urgent-redemption source policies.
             if (_normalRedemptionJpyStatus(source) != JPY_PROVENANCE_FRESH) return (price, true);
 
             _lastGoodRedemptionPrice = price;

@@ -46,7 +46,7 @@ interface IStrategy {
     function estimatedTotalUnderlying() external view returns (uint256);
 
     /// @notice Push underlying back to the Vault. Caller must hold the
-    ///         ALLOCATOR_ROLE on the Vault. Used for deallocation /
+    ///         WITHDRAWER_ROLE on the Vault. Used for deallocation /
     ///         portfolio rebalancing / removeStrategy preparation.
     /// @param  _amount Requested amount. The actual sent amount may be less
     ///         if the upstream protocol cannot fulfill the full request.
@@ -54,7 +54,7 @@ interface IStrategy {
     function sendToVault(uint256 _amount) external returns (uint256 sent);
 
     /// @notice Push only realized yield to the Vault. Caller must hold the
-    ///         ALLOCATOR_ROLE on the Vault. The amount is computed by the
+    ///         HARVESTER_ROLE on the Vault. The amount is computed by the
     ///         Strategy as `realizedYield()` at call time; the caller does
     ///         not supply an amount.
     /// @return sent   Amount actually received by the Vault.

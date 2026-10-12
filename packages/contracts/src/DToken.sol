@@ -10,6 +10,7 @@ import "openzeppelin-contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "openzeppelin-contracts-upgradeable/access/OwnableUpgradeable.sol";
 
 import "./Interfaces/IDToken.sol";
+import {IAddressesRegistry} from "src/Interfaces/IAddressesRegistry.sol";
 
 /**
  * @title DToken - Collateral Benefit Token (Upgradeable)
@@ -50,7 +51,7 @@ contract DToken is
     uint256 private _decimalMultiplier;
 
     /// @notice Maximum supply cap for dToken
-    /// @dev 18 decimals. Default is type(uint256).max (unlimited)
+    /// @dev 18 decimals. Starts closed until the branch's risk parameters are final.
     uint256 public override cap;
 
     /// @notice Pending owner for two-step ownership transfer
@@ -59,11 +60,14 @@ contract DToken is
     /// @notice Underlying tokens allowed for this dToken binding.
     mapping(address => bool) public override allowedUnderlying;
 
+    /// @notice One-shot binding to the Core branch that controls mint readiness.
+    address public override riskParamsRegistry;
+
     /// @dev Storage gap for future upgrades. See OpenZeppelin's storage gap guidance:
     /// https://docs.openzeppelin.com/upgrades-plugins/writing-upgradeable#storage-gaps
     /// Always append new storage variables above this gap and shrink the gap
     /// instead of inserting variables between existing storage slots.
-    uint256[48] private __gap;
+    uint256[47] private __gap;
 
     // --- Errors ---
 
@@ -103,10 +107,17 @@ contract DToken is
     /// @notice Ownership renounce is disabled to preserve governance controls
     error RenounceOwnershipDisabled();
 
+    error DToken__RiskParamsNotFinalized();
+    error DToken__RiskParamsRegistryAlreadySet();
+    error DToken__RegistryCollateralMismatch();
+    error DToken__CapMustBeZero();
+
     // --- Events ---
 
     /// @notice Emitted when cap is updated
     event CapUpdated(uint256 oldCap, uint256 newCap);
+
+    event RiskParamsRegistryBound(address indexed registry);
 
     /// @notice Emitted when token metadata and underlying asset are configured
     event TokenInfoSet(string name, string symbol, address indexed underlying, uint8 underlyingDecimals);
@@ -151,9 +162,6 @@ contract DToken is
         _transferOwnership(_owner);
 
         vault = _vault;
-
-        // Default cap is unlimited
-        cap = type(uint256).max;
     }
 
     /**
@@ -293,6 +301,7 @@ contract DToken is
         // setTokenInfo() (SupplyAlreadyExists), stranding the dToken at placeholder
         // metadata with reverting conversions. Enforces "no mint before bind" on-chain.
         if (address(underlying) == address(0)) revert TokenInfoNotSet();
+        _requireRiskParamsFinalized();
         uint256 newTotalSupply = totalSupply() + _amount;
         if (newTotalSupply > cap) {
             revert CapExceeded(newTotalSupply, cap);
@@ -356,9 +365,30 @@ contract DToken is
      * @param _newCap New cap value (18 decimals)
      */
     function setCap(uint256 _newCap) external override onlyOwner {
+        if (_newCap != 0) _requireRiskParamsFinalized();
         uint256 oldCap = cap;
         cap = _newCap;
         emit CapUpdated(oldCap, _newCap);
+    }
+
+    /// @inheritdoc IDToken
+    function setRiskParamsRegistry(address _registry) external override onlyOwner {
+        if (riskParamsRegistry != address(0)) revert DToken__RiskParamsRegistryAlreadySet();
+        if (_registry.code.length == 0) revert NotContract();
+        if (cap != 0) revert DToken__CapMustBeZero();
+        if (totalSupply() != 0) revert SupplyAlreadyExists();
+        if (address(IAddressesRegistry(_registry).collToken()) != address(this)) {
+            revert DToken__RegistryCollateralMismatch();
+        }
+        riskParamsRegistry = _registry;
+        emit RiskParamsRegistryBound(_registry);
+    }
+
+    function _requireRiskParamsFinalized() internal view {
+        address registry = riskParamsRegistry;
+        if (registry == address(0) || !IAddressesRegistry(registry).riskParamsFinalized()) {
+            revert DToken__RiskParamsNotFinalized();
+        }
     }
 
     /**

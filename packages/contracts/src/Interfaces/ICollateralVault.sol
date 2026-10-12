@@ -108,6 +108,7 @@ interface ICollateralVault {
         uint256 backingRatioAfter
     );
     event StrategyValuationMaxAgeUpdated(uint256 oldMaxAge, uint256 newMaxAge);
+    event StrategyValuationGasBudgetUpdated(uint256 oldBudget, uint256 newBudget);
     event StrategyValuationRefreshed(
         address indexed strategy, uint256 estimatedUnderlying, uint256 principal, uint256 conservativeValue
     );
@@ -146,6 +147,8 @@ interface ICollateralVault {
     function pausedAllocation() external view returns (bool);
     function pendingWithdrawals() external view returns (uint256);
     function strategyValuationMaxAge() external view returns (uint256);
+    /// @notice Gas forwarded to each Strategy valuation probe (`estimatedTotalUnderlying`, `principal`).
+    function strategyValuationGasBudget() external view returns (uint256);
     function strategyValuationCaches(IStrategy _strategy)
         external
         view
@@ -156,6 +159,8 @@ interface ICollateralVault {
     /// @dev `available == false` means at least one registered Strategy had
     ///      neither a live valuation nor a fresh cache. Feeds must treat this as
     ///      oracle failure, not as a measured total loss.
+    ///      Availability remains true when known assets cover all liabilities,
+    ///      even if another Strategy cannot be valued.
     function backingRatioForPricing() external view returns (uint256 ratio, bool available);
 
     // --- User Functions ---
@@ -224,7 +229,7 @@ interface ICollateralVault {
     // --- Yield / Treasury Functions ---
 
     /// @notice Send the managed-asset surplus over current liabilities to the treasury.
-    ///         ALLOCATOR_ROLE. Computes
+    ///         TREASURY_TRANSFER_ROLE. Computes
     ///         `managedUnderlying - (dToken backing + pendingWithdrawals)` using the
     ///         liquid buffer plus conservative per-Strategy view
     ///         `min(estimatedTotalUnderlying, principal)`, explicitly excluding
@@ -258,22 +263,25 @@ interface ICollateralVault {
     ///      set this from an incident dry-run to prevent over-markdown / state drift.
     function writeoffStrategyPrincipal(IStrategy _strategy, uint256 _amount, uint256 _minBackingRatioAfter) external;
 
-    /// @notice Realize a bounded Morpho V2 force-deallocation penalty through
-    ///         the Vault incident rails. WRITEOFF_ROLE only.
+    /// @notice Atomically force-deallocate Morpho V2 liquidity and recover it
+    ///         to this Vault with a bounded penalty. WRITEOFF_ROLE only.
     /// @dev Atomically pauses allocation and user Vault flows, calls the
-    ///      registered Strategy, refreshes/reduces its valuation cache, and
-    ///      reverts the whole transaction if post-loss backing is below the
-    ///      caller-provided floor.
+    ///      registered Strategy, and refreshes/reduces its valuation cache.
+    ///      Reverts the penalty and recovery together if actual Vault receipt
+    ///      is below the nonzero minimum or post-loss backing is below its floor.
     function forceDeallocateMorphoV2(
         IStrategy _strategy,
         address _adapter,
         bytes calldata _data,
         uint256 _assets,
+        uint256 _minReceived,
         uint256 _minBackingRatioAfter
     ) external returns (uint256 penaltyShares, uint256 penaltyAssets, uint256 valuationLossAssets);
 
     function setAllocatorConfig(uint256 _maxMove, uint256 _cooldown) external;
     function setStrategyValuationMaxAge(uint256 _maxAge) external;
+    /// @notice Retune the per-probe Strategy valuation gas budget. GOV_ROLE; bounded to [100_000, 2_000_000].
+    function setStrategyValuationGasBudget(uint256 _budget) external;
     function refreshStrategyValuation(IStrategy _strategy) external returns (bool refreshed);
     /// @notice Drop a Strategy's fallback valuation cache. GOV_ROLE, or WRITEOFF_ROLE after allocation is paused
     ///         or the Strategy is disabled.

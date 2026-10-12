@@ -142,8 +142,7 @@ contract ERC4626Strategy is BaseStrategy {
      * @notice Redeem as many ERC-4626 shares as currently possible and
      *         immediately push all idle underlying back to the Vault.
      * @dev Owner only. The Vault receipt is accounted as returned principal. If
-     *      recovered plus still-valued assets are short of principal, GOV should
-     *      follow up with `Vault.writeoffStrategyPrincipal(...)`.
+     *      recovered plus still-valued assets are short of principal, a Vault WRITEOFF_ROLE holder must call `Vault.writeoffStrategyPrincipal(...)`.
      */
     function emergencyWithdrawFromERC4626() external onlyOwner nonReentrantStrategy returns (uint256 sent) {
         uint256 currentShareBalance = erc4626Vault.balanceOf(address(this));

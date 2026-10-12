@@ -36,11 +36,18 @@ contract PILAllocator is ReentrancyGuard {
     mapping(address => bool) public registeredInitiatives;
     mapping(address => uint256) public initiativeIndexPlusOne;
     mapping(address => uint256) public weightOf;
+    mapping(address => bool) public deferredFunding;
+    mapping(address => uint256) public pendingFunding;
+    uint256 public totalPendingFunding;
 
     event InitiativeRegistered(address indexed initiative, uint256 atEpoch, bool hookSucceeded);
     event InitiativeUnregistered(address indexed initiative, uint256 atEpoch, bool hookSucceeded);
     event WeightsUpdated(address[] initiatives, uint256[] weights);
     event Distributed(address indexed initiative, uint256 amount, uint256 indexed epoch, bool hookSucceeded);
+    event FundingDeferred(address indexed initiative);
+    event FundingReserved(address indexed initiative, uint256 amount, uint256 indexed epoch);
+    event FundingClaimed(address indexed initiative, uint256 amount);
+    event FundingReleased(address indexed initiative, uint256 amount);
     event Paused();
     event Unpaused();
     event GuardianUpdated(address indexed oldGuardian, address indexed newGuardian);
@@ -65,6 +72,8 @@ contract PILAllocator is ReentrancyGuard {
     error PILAllocator__DependencyNotContract(address dependency);
     error PILAllocator__InsufficientGasForHook();
     error PILAllocator__TooManyInitiatives(uint256 maxInitiatives);
+    error PILAllocator__RegistrationHookFailed(address initiative);
+    error PILAllocator__FundingNotDeferred();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert PILAllocator__Unauthorized();
@@ -119,6 +128,8 @@ contract PILAllocator is ReentrancyGuard {
         bool hookSucceeded = _safeCallWithMinGas(
             _initiative, MIN_GAS_TO_HOOK, 0, abi.encodeCall(IInitiative.onRegisterInitiative, (currentEpoch))
         );
+        // Funding-mode setup must succeed before an initiative can receive a weight.
+        if (!hookSucceeded) revert PILAllocator__RegistrationHookFailed(_initiative);
 
         emit InitiativeRegistered(_initiative, currentEpoch, hookSucceeded);
     }
@@ -131,6 +142,11 @@ contract PILAllocator is ReentrancyGuard {
         delete weightOf[_initiative];
         registeredInitiatives[_initiative] = false;
         _removeInitiative(_initiative);
+        uint256 released = pendingFunding[_initiative];
+        delete pendingFunding[_initiative];
+        delete deferredFunding[_initiative];
+        totalPendingFunding -= released;
+        if (released != 0) emit FundingReleased(_initiative, released);
 
         uint256 currentEpoch = epoch();
         bool hookSucceeded = _safeCallWithMinGas(
@@ -163,7 +179,7 @@ contract PILAllocator is ReentrancyGuard {
     function distribute() external nonReentrant returns (uint256 total) {
         if (paused) revert PILAllocator__Paused();
 
-        uint256 balance = jpydfToken.balanceOf(address(this));
+        uint256 balance = jpydfToken.balanceOf(address(this)) - totalPendingFunding;
         if (balance < MIN_DISTRIBUTE || totalWeight == 0 || _initiatives.length == 0) return 0;
 
         uint256 currentEpoch = epoch();
@@ -176,12 +192,40 @@ contract PILAllocator is ReentrancyGuard {
             if (amount == 0) continue;
 
             total += amount;
+            if (deferredFunding[initiative]) {
+                pendingFunding[initiative] += amount;
+                totalPendingFunding += amount;
+                emit FundingReserved(initiative, amount, currentEpoch);
+                continue;
+            }
             jpydfToken.safeTransfer(initiative, amount);
             bool hookSucceeded = _safeCallWithMinGas(
                 initiative, MIN_GAS_TO_HOOK, 0, abi.encodeCall(IInitiative.onClaimForInitiative, (currentEpoch, amount))
             );
 
             emit Distributed(initiative, amount, currentEpoch, hookSucceeded);
+        }
+    }
+
+    /// @dev A registered receiver may opt into funding retained here until it claims.
+    /// Registration hooks use this without a reentrancy guard; no assets leave here.
+    function enableDeferredFunding() external {
+        if (!registeredInitiatives[msg.sender]) revert PILAllocator__NotRegistered(msg.sender);
+        deferredFunding[msg.sender] = true;
+        emit FundingDeferred(msg.sender);
+    }
+
+    /// @dev The initiative calls this within its atomic funding/consumption transaction.
+    function claimDeferredFunding() external nonReentrant returns (uint256 amount) {
+        if (paused) revert PILAllocator__Paused();
+        if (!registeredInitiatives[msg.sender]) revert PILAllocator__NotRegistered(msg.sender);
+        if (!deferredFunding[msg.sender]) revert PILAllocator__FundingNotDeferred();
+        amount = pendingFunding[msg.sender];
+        delete pendingFunding[msg.sender];
+        totalPendingFunding -= amount;
+        if (amount != 0) {
+            jpydfToken.safeTransfer(msg.sender, amount);
+            emit FundingClaimed(msg.sender, amount);
         }
     }
 
@@ -248,7 +292,7 @@ contract PILAllocator is ReentrancyGuard {
     }
 
     function pendingDistributable() external view returns (uint256 amount) {
-        amount = jpydfToken.balanceOf(address(this));
+        amount = jpydfToken.balanceOf(address(this)) - totalPendingFunding;
         if (amount < MIN_DISTRIBUTE || totalWeight == 0 || _initiatives.length == 0) return 0;
         amount = amount * totalWeight / WAD;
     }

@@ -125,6 +125,9 @@ contract TroveManager is LiquityBase, ITroveManager, ITroveEvents {
     // Timestamp at which branch was shut down. 0 if not shut down.
     uint256 public shutdownTime;
 
+    // Set at deployment, then finalized once with risk parameters on reserved branches.
+    uint256 internal collGasCompensationCap;
+
     /*
     * --- Variable container structs for liquidations ---
     *
@@ -172,6 +175,7 @@ contract TroveManager is LiquityBase, ITroveManager, ITroveEvents {
 
     error EmptyData();
     error NothingToLiquidate();
+    error CallerNotAddressesRegistry();
     error CallerNotBorrowerOperations();
     error CallerNotCollateralRegistry();
     error OnlyOneTroveLeft();
@@ -192,7 +196,11 @@ contract TroveManager is LiquityBase, ITroveManager, ITroveEvents {
     event SortedTrovesAddressChanged(address _sortedTrovesAddress);
     event CollateralRegistryAddressChanged(address _collateralRegistryAddress);
 
-    constructor(IAddressesRegistry _addressesRegistry) LiquityBase(_addressesRegistry) {
+    constructor(IAddressesRegistry _addressesRegistry, uint256 _collGasCompensationCap)
+        LiquityBase(_addressesRegistry)
+    {
+        require(_collGasCompensationCap > 0 && _collGasCompensationCap <= COLL_GAS_COMPENSATION_CAP);
+        collGasCompensationCap = _collGasCompensationCap;
         addressesRegistry = _addressesRegistry;
         CCR = _addressesRegistry.CCR();
         MCR = _addressesRegistry.MCR();
@@ -220,20 +228,15 @@ contract TroveManager is LiquityBase, ITroveManager, ITroveEvents {
         emit CollateralRegistryAddressChanged(address(collateralRegistry));
     }
 
-    function syncRiskParams(
-        uint256 _ccr,
-        uint256 _mcr,
-        uint256 _scr,
-        uint256 _liquidationPenaltySP,
-        uint256 _liquidationPenaltyRedistribution
-    ) external override {
-        require(msg.sender == address(addressesRegistry));
+    function syncRiskParams(RiskParams calldata _riskParams) external override {
+        if (msg.sender != address(addressesRegistry)) revert CallerNotAddressesRegistry();
 
-        CCR = _ccr;
-        MCR = _mcr;
-        SCR = _scr;
-        LIQUIDATION_PENALTY_SP = _liquidationPenaltySP;
-        LIQUIDATION_PENALTY_REDISTRIBUTION = _liquidationPenaltyRedistribution;
+        CCR = _riskParams.CCR;
+        MCR = _riskParams.MCR;
+        SCR = _riskParams.SCR;
+        LIQUIDATION_PENALTY_SP = _riskParams.LIQUIDATION_PENALTY_SP;
+        LIQUIDATION_PENALTY_REDISTRIBUTION = _riskParams.LIQUIDATION_PENALTY_REDISTRIBUTION;
+        collGasCompensationCap = _riskParams.COLL_GAS_COMPENSATION_CAP;
     }
 
     // --- Getters ---
@@ -355,9 +358,8 @@ contract TroveManager is LiquityBase, ITroveManager, ITroveEvents {
     }
 
     // Return the amount of Coll to be drawn from a trove's collateral and sent as gas compensation.
-    function _getCollGasCompensation(uint256 _coll) internal pure returns (uint256) {
-        // _entireDebt should never be zero, but we add the condition defensively to avoid an unexpected revert
-        return LiquityMath._min(_coll / COLL_GAS_COMPENSATION_DIVISOR, COLL_GAS_COMPENSATION_CAP);
+    function _getCollGasCompensation(uint256 _coll) internal view returns (uint256) {
+        return LiquityMath._min(_coll / COLL_GAS_COMPENSATION_DIVISOR, collGasCompensationCap);
     }
 
     /* In a full liquidation, returns the values for a trove's coll and debt to be offset, and coll and debt to be

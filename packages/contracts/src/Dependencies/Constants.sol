@@ -26,7 +26,7 @@ uint256 constant CCR_DWSTETH = 14167 * _1pct / 100; // 141.67%
 uint256 constant SCR_DWSTETH = 110 * _1pct; // 110%
 uint256 constant BCR_DWSTETH = 10 * _1pct; // 10%
 uint256 constant LIQUIDATION_PENALTY_SP_DWSTETH = 5 * _1pct; // 5%
-uint256 constant LIQUIDATION_PENALTY_REDISTRIBUTION_DWSTETH = 10 * _1pct; // 10%
+uint256 constant LIQUIDATION_PENALTY_REDISTRIBUTION_DWSTETH = 20 * _1pct; // 20%
 
 // Branch 1: dUSDC (USDC) — confirmed
 uint256 constant MCR_DUSDC = 11158 * _1pct / 100; // 111.58%
@@ -70,7 +70,7 @@ uint256 constant LIQUIDATION_PENALTY_SP_DUSD_B = 5 * _1pct; // 5%
 uint256 constant LIQUIDATION_PENALTY_REDISTRIBUTION_DUSD_B = 10 * _1pct; // 10%
 
 // Branch 6: dJPY (Underlying TBD) — inert, JPY/JGB low-volatility model
-uint256 constant MCR_DJPY = 10530 * _1pct / 100; // 105.30%
+uint256 constant MCR_DJPY = 10553 * _1pct / 100; // 105.53%
 uint256 constant CCR_DJPY = 10730 * _1pct / 100; // 107.30%
 uint256 constant SCR_DJPY = 10330 * _1pct / 100; // 103.30%
 uint256 constant BCR_DJPY = 5 * _1pct; // 5%
@@ -78,7 +78,7 @@ uint256 constant LIQUIDATION_PENALTY_SP_DJPY = 5 * _1pct; // 5%
 uint256 constant LIQUIDATION_PENALTY_REDISTRIBUTION_DJPY = 5 * _1pct; // 5%
 
 // Branch 7: dJGB (Underlying TBD) — inert, JPY/JGB low-volatility model
-uint256 constant MCR_DJGB = 10530 * _1pct / 100; // 105.30%
+uint256 constant MCR_DJGB = 10553 * _1pct / 100; // 105.53%
 uint256 constant CCR_DJGB = 10730 * _1pct / 100; // 107.30%
 uint256 constant SCR_DJGB = 10330 * _1pct / 100; // 103.30%
 uint256 constant BCR_DJGB = 5 * _1pct; // 5%
@@ -87,7 +87,8 @@ uint256 constant LIQUIDATION_PENALTY_REDISTRIBUTION_DJGB = 5 * _1pct; // 5%
 
 // Fraction of collateral awarded to liquidator
 uint256 constant COLL_GAS_COMPENSATION_DIVISOR = 200; // dividing by 200 yields 0.5%
-uint256 constant COLL_GAS_COMPENSATION_CAP = 1_000 ether; // Max coll gas compensation capped at 1,000 coll units
+uint256 constant COLL_GAS_COMPENSATION_CAP = 1_000 ether; // dUSDC cap and maximum constructor input
+uint256 constant COLL_GAS_COMPENSATION_CAP_DWSTETH = 2 ether;
 
 // Minimum entire JPYdf debt a Trove must have, including its upfront fee.
 uint256 constant MIN_DEBT = 100_000e18;

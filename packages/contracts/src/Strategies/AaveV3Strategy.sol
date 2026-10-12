@@ -271,7 +271,7 @@ contract AaveV3Strategy is BaseStrategy {
             uint256 balanceAfterClaim = IERC20(_reward).balanceOf(address(this));
             uint256 claimedUnderlying =
                 balanceAfterClaim > balanceBeforeClaim ? balanceAfterClaim - balanceBeforeClaim : 0;
-            settled = _sendUnderlyingYieldToVault(claimedUnderlying);
+            settled = _sendUnderlyingToVault(claimedUnderlying);
             emit AaveUnderlyingRewardsClaimed(address(_rewardsController), _reward, _amount, claimed, settled);
         } else {
             settled = _sweepRewardToken(IERC20(_reward), type(uint256).max);
@@ -288,7 +288,7 @@ contract AaveV3Strategy is BaseStrategy {
      *         liquid third-party donations) and immediately push all idle
      *         underlying back to the Vault. The Vault receipt is accounted as
      *         returned principal; if the remaining Aave-accounted position is
-     *         later deemed unrecoverable, GOV should follow up with
+     *         later deemed unrecoverable, a Vault WRITEOFF_ROLE holder must call
      *         `Vault.writeoffStrategyPrincipal(...)` for that residual.
      * @dev    Owner only. Pushing through `receiveFromStrategy` keeps the
      *         Vault-side valuation cache in sync and avoids an observable

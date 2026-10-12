@@ -23,6 +23,13 @@ interface IDToken is IERC20MetadataUpgradeable, IERC20PermitUpgradeable {
     /// @notice Maximum supply cap for dToken
     function cap() external view returns (uint256);
 
+    /// @notice Core registry bound once before minting; zero means issuance is unavailable.
+    function riskParamsRegistry() external view returns (address);
+
+    /// @notice Bind the matching Core registry once while cap and supply are zero (Owner only).
+    /// @dev Nonzero caps and minting require this registry's riskParamsFinalized to be true.
+    function setRiskParamsRegistry(address _registry) external;
+
     /// @notice Whether an underlying token is allowed for this dToken.
     function allowedUnderlying(address _underlying) external view returns (bool);
 

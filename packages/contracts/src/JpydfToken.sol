@@ -46,10 +46,10 @@ contract JpydfToken is Ownable, IJpydfToken, ERC20Permit {
     event BorrowerOperationsAddressAdded(address _newBorrowerOperationsAddress);
     event ActivePoolAddressAdded(address _newActivePoolAddress);
 
-    constructor(address _initialOwner, address _bridgeAdmin)
+    constructor(address _initialOwner, address _bridgeAdmin, bool _testOnly)
         Ownable(_initialOwner)
-        ERC20(_NAME, _SYMBOL)
-        ERC20Permit(_NAME)
+        ERC20(_testOnly ? "testJPYdf Stablecoin" : _NAME, _testOnly ? "testJPYdf" : _SYMBOL)
+        ERC20Permit(_testOnly ? "testJPYdf Stablecoin" : _NAME)
     {
         if (_initialOwner == address(0)) revert JpydfToken__ZeroOwner();
         if (_bridgeAdmin == address(0)) revert JpydfToken__ZeroBridgeAdmin();

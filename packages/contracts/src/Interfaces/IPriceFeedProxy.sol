@@ -21,8 +21,10 @@ import "./IBorrowerOperations.sol";
 interface IPriceFeedProxy is IPriceFeed {
     // --- Events ---
     event SourceUpdated(address indexed oldSource, address indexed newSource);
-    /// @dev oldPrice / oldRedemptionPrice are the healthy old source's live prices, or the
-    ///      proxy's path-specific last-good references when oldSourceHealthy is false.
+    /// @dev oldPrice is live when oldSourceHealthy is true, otherwise cached.
+    ///      oldRedemptionPrice is cached if the old source is unhealthy OR its JPY
+    ///      provenance is invalid or at least 30 hours old, even when oldSourceHealthy
+    ///      is true. The flag describes source fetches, not redemption-cache provenance.
     ///      priceGuardBypassed is true only for an explicit confirmSourceEmergency call.
     event SourceSwitchValidated(
         address indexed oldSource,

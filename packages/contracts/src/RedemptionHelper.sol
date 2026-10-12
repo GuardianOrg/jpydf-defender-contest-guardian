@@ -136,7 +136,7 @@ contract RedemptionHelper is IRedemptionHelper {
 
                 // Normally this is no different from `_jpydf`, but can be less if the redemption on this branch
                 // terminated due to hitting the iteration limit. We're looking for the smallest extrapolated value,
-                // since that is the maximum amount of JPYDF that can be redeemed proportionally within the given
+                // since that bounds the proportional request amount within the given
                 // iteration limit. Any attempt to redeem more than this would result in a partial redemption, thus
                 // paying a higher redemption fee than necessary — since the fee is based on the attempted amount.
                 if (extrapolatedJpydf < truncatedJpydf) truncatedJpydf = extrapolatedJpydf;

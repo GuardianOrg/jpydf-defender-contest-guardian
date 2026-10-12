@@ -94,11 +94,8 @@ contract BorrowerOperations is LiquityBase, AddRemoveManagers, IBorrowerOperatio
         IJpydfToken jpydfToken;
         LatestTroveData trove;
         uint256 price;
-        bool isBelowCriticalThreshold;
-        uint256 newICR;
         uint256 newDebt;
         uint256 newColl;
-        bool newOracleFailureDetected;
     }
 
     struct LocalVariables_setInterestBatchManager {
@@ -575,17 +572,16 @@ contract BorrowerOperations is LiquityBase, AddRemoveManagers, IBorrowerOperatio
         TroveChange memory _troveChange,
         uint256 _maxUpfrontFee
     ) internal {
-        // During a recoverable oracle pause, only collateral additions and debt repayments may reach the live-price check.
-        if ((_troveChange.collDecrease | _troveChange.debtIncrease) != 0 || hasBeenShutDown) {
+        LocalVariables_adjustTrove memory vars;
+        bool riskIncreasing = (_troveChange.collDecrease | _troveChange.debtIncrease) != 0;
+        // Pure collateral additions and repayments remain available during an oracle pause.
+        if (riskIncreasing || hasBeenShutDown) {
             _requireIsNotShutDown();
+            vars.price = _requireOraclesLive();
         }
 
-        LocalVariables_adjustTrove memory vars;
         vars.activePool = activePool;
         vars.jpydfToken = jpydfToken;
-
-        vars.price = _requireOraclesLive();
-        vars.isBelowCriticalThreshold = _checkBelowCriticalThreshold(vars.price, CCR);
 
         // --- Checks ---
 
@@ -594,7 +590,7 @@ contract BorrowerOperations is LiquityBase, AddRemoveManagers, IBorrowerOperatio
         address owner = troveNFT.ownerOf(_troveId);
         address receiver = owner; // If it’s a withdrawal, and remove manager privilege is set, a different receiver can be defined
 
-        if (_troveChange.collDecrease > 0 || _troveChange.debtIncrease > 0) {
+        if (riskIncreasing) {
             receiver = _requireSenderIsOwnerOrRemoveManagerAndGetReceiver(_troveId, owner);
         } else {
             // RemoveManager assumes AddManager, so if the former is set, there's no need to check the latter
@@ -672,10 +668,8 @@ contract BorrowerOperations is LiquityBase, AddRemoveManagers, IBorrowerOperatio
         // Now the max repayment is capped to stay above MIN_DEBT, so this only applies to adjustZombieTrove
         _requireAtLeastMinDebt(vars.newDebt);
 
-        vars.newICR = LiquityMath._computeCR(vars.newColl, vars.newDebt, vars.price);
-
-        // Check the adjustment satisfies all conditions for the current system mode
-        _requireValidAdjustmentInCurrentMode(_troveChange, vars, isTroveInBatch);
+        // Pure repayment/addition improves backing even below MCR/CCR.
+        if (riskIncreasing) _requireValidAdjustmentInCurrentMode(_troveChange, vars, isTroveInBatch);
 
         // --- Effects and interactions ---
 
@@ -892,7 +886,7 @@ contract BorrowerOperations is LiquityBase, AddRemoveManagers, IBorrowerOperatio
     }
 
     function lowerBatchManagementFee(uint256 _newAnnualManagementFee) external {
-        _requireIsNotShutDown();
+        if (hasBeenShutDown) revert IsShutDown();
         _requireValidInterestBatchManager(msg.sender);
 
         ITroveManager troveManagerCached = troveManager;
@@ -1242,7 +1236,7 @@ contract BorrowerOperations is LiquityBase, AddRemoveManagers, IBorrowerOperatio
         uint256 totalColl = getEntireBranchColl();
         uint256 totalDebt = getEntireBranchDebt();
         (uint256 price, bool newOracleFailureDetected) = priceFeed.fetchPrice();
-        // If the oracle failed, the above call to PriceFeed will have shut this branch down
+        // Reject failed quotes, including aged JPY provenance, without permanent shutdown.
         if (newOracleFailureDetected) return;
 
         // Otherwise, proceed with the TCR check:
@@ -1341,8 +1335,8 @@ contract BorrowerOperations is LiquityBase, AddRemoveManagers, IBorrowerOperatio
 
     function _requireNonZeroAdjustment(TroveChange memory _troveChange) internal pure {
         if (
-            _troveChange.collIncrease == 0 && _troveChange.collDecrease == 0 && _troveChange.debtIncrease == 0
-                && _troveChange.debtDecrease == 0
+            (_troveChange.collIncrease | _troveChange.collDecrease | _troveChange.debtIncrease | _troveChange.debtDecrease)
+                == 0
         ) {
             revert ZeroAdjustment();
         }
@@ -1437,6 +1431,8 @@ contract BorrowerOperations is LiquityBase, AddRemoveManagers, IBorrowerOperatio
         LocalVariables_adjustTrove memory _vars,
         bool _isTroveInBatch
     ) internal view {
+        uint256 price = _vars.price;
+        uint256 newICR = LiquityMath._computeCR(_vars.newColl, _vars.newDebt, price);
         /*
         * Below Critical Threshold, it is not permitted:
         *
@@ -1452,15 +1448,15 @@ contract BorrowerOperations is LiquityBase, AddRemoveManagers, IBorrowerOperatio
         */
 
         if (_isTroveInBatch) {
-            _requireICRisAboveMCRPlusBCR(_vars.newICR);
+            _requireICRisAboveMCRPlusBCR(newICR);
         } else {
-            _requireICRisAboveMCR(_vars.newICR);
+            _requireICRisAboveMCR(newICR);
         }
 
-        uint256 newTCR = _getNewTCRFromTroveChange(_troveChange, _vars.price);
-        if (_vars.isBelowCriticalThreshold) {
+        uint256 newTCR = _getNewTCRFromTroveChange(_troveChange, price);
+        if (_checkBelowCriticalThreshold(price, CCR)) {
             _requireNoBorrowingUnlessNewTCRisAboveCCR(_troveChange.debtIncrease, newTCR);
-            _requireDebtRepaymentGeCollWithdrawal(_troveChange, _vars.price);
+            _requireDebtRepaymentGeCollWithdrawal(_troveChange, price);
         } else {
             // if Normal Mode
             _requireNewTCRisAboveCCR(newTCR);
